@@ -1,0 +1,5 @@
+lsxtradesyesterday_20240404.csv
+lsxtradesyesterday_*.csv
+processed_trades.csv
+*.csv
+raw_output.parquet
