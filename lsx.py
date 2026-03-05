@@ -15,12 +15,16 @@ import numpy as np
 ##MAIN
 
 #Step 1: all files in last directory
-files = glob.glob(r'c:\temp\lsx\last\lsxtradesyesterday_*.csv')
+files = glob.glob(r'lsxtradesyesterday_*.csv')
 # Step 2: Read all CSVs into Polars DataFrames
 
 df_list = [pl.read_csv(f, infer_schema_length=100,separator=";",decimal_comma=True) for f in files]
 #delete name column from all frames
 for index,dlist in enumerate(df_list):
+        # Rename orderId to TVTIC if it exists to ensure consistency across files
+        if 'orderId' in df_list[index].columns:
+            df_list[index] = df_list[index].rename({'orderId': 'TVTIC'})
+
         if len(df_list[index].columns) == 11:
             df_list[index]=df_list[index].drop('displayName')
 
@@ -72,5 +76,5 @@ df=df_sorted.unique(subset=['TVTIC'],keep='last')
 print('unicated, now dropping canceled transactions')
 df=df.filter(~pl.col('flags').str.contains('CANC'))
 
-df.write_parquet('c:\\temp\\lsx\\raw24_07_23to25_03_30.parquet')
+df.write_parquet('raw_output.parquet')
        
