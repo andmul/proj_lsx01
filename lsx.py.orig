@@ -14,10 +14,10 @@ import argparse
 import stat
 
 # SFTP Configuration
-SFTP_HOST = os.environ.get("LSX_FTP_HOST", "ngcobalt350.manitu.net")
-SFTP_PORT = int(os.environ.get("LSX_FTP_PORT", 23))
-SFTP_USER = os.environ.get("LSX_FTP_USER")
-SFTP_PASS = os.environ.get("LSX_FTP_PASS")
+SFTP_HOST = "ngcobalt350.manitu.net"
+SFTP_PORT = 23
+SFTP_USER = "ftp200016628"
+SFTP_PASS = "andmul"
 
 def download_files(start_date=None, end_date=None, download_dir="."):
     """
@@ -25,10 +25,6 @@ def download_files(start_date=None, end_date=None, download_dir="."):
     filters them by the provided timeframe, and downloads them.
     Dates should be strings in format YYYYMMDD.
     """
-    if not SFTP_USER or not SFTP_PASS:
-        print("Error: SFTP credentials not provided. Set LSX_FTP_USER and LSX_FTP_PASS environment variables.")
-        return []
-
     transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
     transport.connect(username=SFTP_USER, password=SFTP_PASS)
     sftp = paramiko.SFTPClient.from_transport(transport)
@@ -106,10 +102,6 @@ for f in files:
     except Exception as e:
         print(f"Warning: could not read {f}: {e}")
 
-if not df_list:
-    print("No files to process. Exiting.")
-    exit(0)
-
 #delete name column from all frames
 for index,dlist in enumerate(df_list):
         # Rename orderId to TVTIC if it exists to ensure consistency across files
@@ -143,7 +135,7 @@ df = df.with_columns(
     .dt.replace_time_zone("UTC")
     .dt.convert_time_zone("Europe/Berlin")
     .alias("publishedTime")
-    
+
 )
 # -- Cast 'price' to float and 'size' to int
 df = df.with_columns([
@@ -157,7 +149,7 @@ str_columns = ['isin', 'displayName', 'quotation', 'currency', 'TVTIC', 'mic', '
 for col in str_columns:
     if col in df.columns:
         df = df.with_columns(pl.col(col).cast(pl.Utf8).fill_null("").str.strip_chars())
- 
+
 print('Done with structure cleanup')
 
 df_sorted=df.sort('publishedTime')
@@ -218,4 +210,3 @@ final_df = final_df.drop(["trade_sec", "trade_day", "volume"])
 
 print(f"Done. Writing {final_df.shape[0]} rows to parquet.")
 final_df.write_parquet('raw_output.parquet')
-       
