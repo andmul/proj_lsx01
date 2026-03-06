@@ -44,39 +44,94 @@ def download_files(start_date=None, end_date=None, download_dir="."):
         transport.close()
         return []
 
-    # Print first and last available dates based on filenames
-    def extract_date(filename):
-        # lsxtradesyesterday_YYYYMMDD.csv -> YYYYMMDD
-        parts = filename.split('_')
-        if len(parts) > 1:
-            return parts[1].split('.')[0]
-        return ""
+    import csv
 
-    first_file = target_files[0]
-    last_file = target_files[-1]
-    print(f"Server data ranges from {extract_date(first_file)} to {extract_date(last_file)}")
+    def get_date_from_sftp_file(sftp_client, filename):
+        """Reads the first 10 rows of the file on the SFTP server to determine its true date."""
+        try:
+            with sftp_client.open(filename, 'r') as remote_f:
+                head = []
+                for _ in range(12):  # Header + 10 rows + 1 extra
+                    line = remote_f.readline()
+                    if not line: break
+                    head.append(line)
 
-    # Filter files based on timeframe
-    filtered_files = []
+            reader = csv.DictReader(head, delimiter=';')
+            dates_found = set()
+            rows_read = 0
+            for row in reader:
+                if rows_read >= 10:
+                    break
+                if 'tradeTime' in row and row['tradeTime']:
+                    # Extract '2024-04-03' and convert to '20240403'
+                    date_part = row['tradeTime'][:10].replace('-', '')
+                    dates_found.add(date_part)
+                rows_read += 1
+
+            if len(dates_found) == 0:
+                print(f"Error: Could not find any valid tradeTime in the first 10 rows of {filename}")
+                return None
+            elif len(dates_found) > 1:
+                print(f"Error: Multiple dates found in the first 10 rows of {filename}. Dates found: {dates_found}")
+                return None
+            else:
+                return list(dates_found)[0]
+
+        except Exception as e:
+            print(f"Error reading file {filename} from SFTP: {e}")
+            return None
+
+    # Determine chronological bounds by reading content of first and last file
+    first_date = get_date_from_sftp_file(sftp, target_files[0])
+    last_date = get_date_from_sftp_file(sftp, target_files[-1])
+
+    print(f"Server data (based on content) ranges from {first_date} to {last_date}")
+
+    downloaded_paths = []
+    print(f"Filtering {len(target_files)} files by timeframe...")
     for f in target_files:
-        file_date = extract_date(f)
+        # Instead of scanning every single file on the server (which could take a long time over SFTP for 1000+ files),
+        # we check the local cache first. If it's cached, we parse the local file date.
+        # But if it's not cached, we read the remote header.
+        local_path = os.path.join(download_dir, f)
+
+        file_date = None
+        if os.path.exists(local_path):
+            # Parse from local
+            try:
+                with open(local_path, 'r', encoding='utf-8') as local_f:
+                    head = [next(local_f) for _ in range(12)]
+                reader = csv.DictReader(head, delimiter=';')
+                dates_found = set()
+                rows = 0
+                for row in reader:
+                    if rows >= 10: break
+                    if 'tradeTime' in row and row['tradeTime']:
+                        dates_found.add(row['tradeTime'][:10].replace('-', ''))
+                    rows += 1
+                if len(dates_found) == 1:
+                    file_date = list(dates_found)[0]
+            except StopIteration:
+                pass
+
+        if not file_date:
+            file_date = get_date_from_sftp_file(sftp, f)
+
+        if not file_date:
+            continue
+
+        # Check against timeframe
         if start_date and file_date < start_date:
             continue
         if end_date and file_date > end_date:
             continue
-        filtered_files.append(f)
 
-    print(f"Found {len(filtered_files)} files in the specified timeframe.")
-
-    downloaded_paths = []
-    for f in filtered_files:
-        local_path = os.path.join(download_dir, f)
         downloaded_paths.append(local_path)
         if os.path.exists(local_path):
-            print(f"File {f} already exists locally, skipping download.")
+            print(f"File {f} ({file_date}) already exists locally, skipping download.")
             continue
 
-        print(f"Downloading {f}...")
+        print(f"Downloading {f} ({file_date})...")
         sftp.get(f, local_path)
 
     sftp.close()
@@ -171,6 +226,9 @@ df = df.with_columns([
 ])
 
 # For cancellations, size is negated to subtract from the group
+# Note regarding AMND flags: As requested, AMND sizes are treated identically to
+# original trades. They simply inject the stated replacement 'size' into the timeframe aggregate
+# so that the ultimate SUM(size) reaches the mathematically desired target.
 df = df.with_columns(
     pl.when(pl.col("flags").str.contains("CANC"))
     .then(pl.col("size") * -1)

@@ -17,21 +17,46 @@ def check_files(directory="."):
 
     valid_files_by_date = {}
     for f in files:
-        filename = os.path.basename(f)
-        # Extract YYYYMMDD
-        parts = filename.split('_')
-        if len(parts) >= 2:
-            date_str = parts[1].split('.')[0]
-            if len(date_str) == 8 and date_str.isdigit():
-                try:
-                    file_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
-                    # Only care about 2023-2026
-                    if 2023 <= file_date.year <= 2026:
-                        size = os.path.getsize(f)
-                        if size >= MIN_SIZE_BYTES:
-                            valid_files_by_date[file_date] = f
-                except ValueError:
-                    pass
+        size = os.path.getsize(f)
+        if size < MIN_SIZE_BYTES:
+            continue
+
+        # We need to extract date from the first 10 data rows of the CSV
+        # We use standard library to avoid overhead of loading pandas/polars just for headers
+        import csv
+        dates_found = set()
+        try:
+            with open(f, 'r', encoding='utf-8') as csvfile:
+                # Use a reader that ignores strict quotes in case of errors
+                reader = csv.DictReader(csvfile, delimiter=';')
+
+                rows_read = 0
+                for row in reader:
+                    if rows_read >= 10:
+                        break
+                    if 'tradeTime' in row and row['tradeTime']:
+                        # Example tradeTime: 2024-04-03T05:30:01.109000Z
+                        # Extract the date part: YYYY-MM-DD
+                        date_part = row['tradeTime'][:10]
+                        dates_found.add(date_part)
+                    rows_read += 1
+
+        except Exception as e:
+            print(f"Error reading file {f}: {e}")
+            continue
+
+        if len(dates_found) == 0:
+            print(f"Error: Could not find any valid tradeTime in the first 10 rows of {f}")
+        elif len(dates_found) > 1:
+            print(f"Error: Multiple dates found in the first 10 rows of {f}. Dates found: {dates_found}")
+        else:
+            date_str = list(dates_found)[0]
+            try:
+                file_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                if 2023 <= file_date.year <= 2026:
+                    valid_files_by_date[file_date] = f
+            except ValueError:
+                print(f"Error: Invalid date format parsed from {f}: {date_str}")
 
     # Determine start and end of our evaluation period
     start_date = datetime.date(2023, 1, 1)
