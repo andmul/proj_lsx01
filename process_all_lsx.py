@@ -164,10 +164,13 @@ def process_transactions(directory, start_date_str, end_date_str):
     end_d = datetime.strptime(end_date_str, "%Y-%m-%d")
 
     # Convert to timezone aware datetime to filter
-    start_dt = start_d.replace(tzinfo=pytz.timezone("Europe/Berlin"))
+    # Using localize for pytz to prevent timezone drift via historical LMT mappings
+    berlin_tz = pytz.timezone("Europe/Berlin")
+    start_dt = berlin_tz.localize(start_d)
+
     # Add 1 day to end_date to include the whole day
     import datetime as dt
-    end_dt = (end_d + dt.timedelta(days=1)).replace(tzinfo=pytz.timezone("Europe/Berlin"))
+    end_dt = berlin_tz.localize(end_d + dt.timedelta(days=1))
 
     grouped = grouped.filter((pl.col("tradeTime") >= start_dt) & (pl.col("tradeTime") < end_dt))
     print(f"Rows strictly within {start_date_str} to {end_date_str}: {grouped.shape[0]}")
@@ -180,7 +183,8 @@ def main():
     parser.add_argument("--dir", default=r"d:\lsx", help="Input directory")
     parser.add_argument("--start", default="2023-08-17", help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default=str(date.today()), help="End date YYYY-MM-DD")
-    args = parser.parse_args()
+    # use parse_known_args to prevent SystemExit in Jupyter Notebook environments
+    args, unknown = parser.parse_known_args()
 
     print(f"Checking directory: {args.dir}")
 
