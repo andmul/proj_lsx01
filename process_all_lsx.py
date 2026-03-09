@@ -86,17 +86,22 @@ def process_transactions(directory, start_date_str, end_date_str):
     df_list = []
     for f in files:
         try:
+            # `ignore_errors` is not fully supported in `scan_csv` when dealing with broken quotes, so
+            # we read eagerly into memory and then convert to a LazyFrame. Since we process files iteratively
+            # and append to a list of LazyFrames, `pl.concat` will stream the execution rather than holding
+            # all raw DataFrames in memory simultaneously.
             df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True)
             if 'orderId' in df.columns:
                 df = df.rename({'orderId': 'TVTIC'})
             if 'displayName' in df.columns:
                 df = df.drop('displayName')
-            df_list.append(df)
+
+            df_list.append(df.lazy())
         except Exception as e:
             print(f"Error reading {f}: {e}")
 
+    # Lazily concatenate all files before executing the query
     df = pl.concat(df_list, how="diagonal")
-    print("Total raw rows:", df.shape[0])
 
     df = df.with_columns(
          pl.col("tradeTime")
@@ -123,7 +128,6 @@ def process_transactions(directory, start_date_str, end_date_str):
     df = df.drop_nulls(["price", "size", "tradeTime"])
 
     df = df.sort('publishedTime').unique(subset=['TVTIC'], keep='last')
-    print("Unique TVTIC rows:", df.shape[0])
 
     # Group by identical timestamp to aggregate split executions and amendments/cancellations
     df = df.with_columns([
@@ -137,7 +141,7 @@ def process_transactions(directory, start_date_str, end_date_str):
         .alias("size")
     )
 
-    print("Consolidating AMND/CANC...")
+    print("Executing lazy evaluation and Consolidating AMND/CANC...")
     grouped = df.group_by(["isin", "trade_sec", "price"]).agg([
         pl.col("size").sum().alias("total_size"),
         pl.col("tradeTime").first().alias("tradeTime"),
@@ -155,11 +159,7 @@ def process_transactions(directory, start_date_str, end_date_str):
     grouped = grouped.rename({"total_size": "size"})
     grouped = grouped.drop(["trade_sec"])
 
-    print(f"Consolidated rows: {grouped.shape[0]}")
-
     # Apply ISIN filter within the timeframe
-    # But wait, first we need to make sure we only filter rows IN the timeframe.
-    # If the user has other files in d:\lsx, we must filter tradeTime before counting!
     start_d = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_d = datetime.strptime(end_date_str, "%Y-%m-%d")
 
@@ -173,9 +173,18 @@ def process_transactions(directory, start_date_str, end_date_str):
     end_dt = berlin_tz.localize(end_d + dt.timedelta(days=1))
 
     grouped = grouped.filter((pl.col("tradeTime") >= start_dt) & (pl.col("tradeTime") < end_dt))
-    print(f"Rows strictly within {start_date_str} to {end_date_str}: {grouped.shape[0]}")
 
-    final_df = filter_isins(grouped, start_date_str, end_date_str)
+    # Call collect() to execute the lazy frame and materialize it into memory
+    print("Collecting final dataframe...")
+    try:
+        collected_df = grouped.collect(engine="streaming")
+    except Exception as e:
+        print(f"Streaming execution failed ({e}), falling back to standard execution...")
+        collected_df = grouped.collect()
+
+    print(f"Rows strictly within {start_date_str} to {end_date_str}: {collected_df.shape[0]}")
+
+    final_df = filter_isins(collected_df, start_date_str, end_date_str)
     return final_df
 
 def main():
