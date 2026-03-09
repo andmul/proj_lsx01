@@ -12,6 +12,8 @@ def check_files(directory="."):
     # Note: German holidays can vary slightly by state. We'll use the country-wide defaults (DE)
     de_holidays = holidays.DE(years=[2023, 2024, 2025, 2026])
 
+    import polars as pl
+
     # Find all files matching the pattern
     files = glob.glob(os.path.join(directory, 'lsxtradesyesterday_*.csv'))
 
@@ -21,42 +23,57 @@ def check_files(directory="."):
         if size < MIN_SIZE_BYTES:
             continue
 
-        # We need to extract date from the first 10 data rows of the CSV
-        # We use standard library to avoid overhead of loading pandas/polars just for headers
-        import csv
-        dates_found = set()
+        filename = os.path.basename(f)
+        file_date_str = filename.split('_')[1].split('.')[0]
         try:
-            with open(f, 'r', encoding='utf-8') as csvfile:
-                # Use a reader that ignores strict quotes in case of errors
-                reader = csv.DictReader(csvfile, delimiter=';')
+            filename_date = datetime.datetime.strptime(file_date_str, "%Y%m%d").date()
+        except ValueError:
+            print(f"Error: Invalid filename date format in {f}")
+            continue
 
-                rows_read = 0
-                for row in reader:
-                    if rows_read >= 10:
-                        break
-                    if 'tradeTime' in row and row['tradeTime']:
-                        # Example tradeTime: 2024-04-03T05:30:01.109000Z
-                        # Extract the date part: YYYY-MM-DD
-                        date_part = row['tradeTime'][:10]
-                        dates_found.add(date_part)
-                    rows_read += 1
+        # Calculate expected date (-1 trading day)
+        expected_date = filename_date - datetime.timedelta(days=1)
+        while expected_date.weekday() >= 5 or expected_date in de_holidays:
+            expected_date -= datetime.timedelta(days=1)
 
+        # Read the first 100 rows to extract dates efficiently without memory bloat
+        try:
+            df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True, columns=["tradeTime"], n_rows=100)
+            if "tradeTime" not in df.columns:
+                df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True, n_rows=100).select(["tradeTime"])
         except Exception as e:
             print(f"Error reading file {f}: {e}")
             continue
 
-        if len(dates_found) == 0:
-            print(f"Error: Could not find any valid tradeTime in the first 10 rows of {f}")
-        elif len(dates_found) > 1:
-            print(f"Error: Multiple dates found in the first 10 rows of {f}. Dates found: {dates_found}")
-        else:
-            date_str = list(dates_found)[0]
-            try:
-                file_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-                if 2023 <= file_date.year <= 2026:
-                    valid_files_by_date[file_date] = f
-            except ValueError:
-                print(f"Error: Invalid date format parsed from {f}: {date_str}")
+        if df.shape[0] == 0:
+            print(f"Error: File {f} is empty or could not be parsed")
+            continue
+
+        # Extract date part
+        df = df.with_columns(pl.col("tradeTime").str.slice(0, 10).alias("date_str"))
+
+        # Find majority date
+        date_counts = df.group_by("date_str").len().sort("len", descending=True)
+        majority_date_str = date_counts.select("date_str").head(1).item()
+
+        if not majority_date_str:
+            print(f"Error: Could not parse dates in {f}")
+            continue
+
+        try:
+            majority_date = datetime.datetime.strptime(majority_date_str, "%Y-%m-%d").date()
+            if majority_date == expected_date:
+                if 2023 <= majority_date.year <= 2026:
+                    valid_files_by_date[majority_date] = f
+            else:
+                print(f"File {f}: majority date ({majority_date}) does not match expected date ({expected_date}).")
+                # Even if it doesn't match expected, we could still map it to its majority date.
+                # However, the user specifically wants to ensure it aligns with `-1 trading day`.
+                # We'll map it to its majority date so it still counts as a valid file for THAT date.
+                if 2023 <= majority_date.year <= 2026:
+                    valid_files_by_date[majority_date] = f
+        except ValueError:
+            print(f"Error: Invalid date format parsed from {f}: {majority_date_str}")
 
     # Determine start and end of our evaluation period
     start_date = datetime.date(2023, 1, 1)

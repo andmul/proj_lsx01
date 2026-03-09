@@ -46,79 +46,48 @@ def download_files(start_date=None, end_date=None, download_dir="."):
 
     import csv
 
-    def get_date_from_sftp_file(sftp_client, filename):
-        """Reads the first 10 rows of the file on the SFTP server to determine its true date."""
-        try:
-            with sftp_client.open(filename, 'r') as remote_f:
-                head = []
-                for _ in range(12):  # Header + 10 rows + 1 extra
-                    line = remote_f.readline()
-                    if not line: break
-                    head.append(line)
+    import holidays
+    import datetime as dt
 
-            reader = csv.DictReader(head, delimiter=';')
-            dates_found = set()
-            rows_read = 0
-            for row in reader:
-                if rows_read >= 10:
-                    break
-                if 'tradeTime' in row and row['tradeTime']:
-                    # Extract '2024-04-03' and convert to '20240403'
-                    date_part = row['tradeTime'][:10].replace('-', '')
-                    dates_found.add(date_part)
-                rows_read += 1
+    # Generate German holidays for calculating -1 trading day
+    # Assuming files from 2020 to 2030
+    de_holidays = holidays.DE(years=list(range(2020, 2030)))
 
-            if len(dates_found) == 0:
-                print(f"Error: Could not find any valid tradeTime in the first 10 rows of {filename}")
-                return None
-            elif len(dates_found) > 1:
-                print(f"Error: Multiple dates found in the first 10 rows of {filename}. Dates found: {dates_found}")
-                return None
-            else:
-                return list(dates_found)[0]
+    def get_previous_trading_day(d):
+        prev_d = d - dt.timedelta(days=1)
+        while prev_d.weekday() >= 5 or prev_d in de_holidays:
+            prev_d -= dt.timedelta(days=1)
+        return prev_d
 
-        except Exception as e:
-            print(f"Error reading file {filename} from SFTP: {e}")
-            return None
+    def extract_expected_date(filename):
+        """Extracts the intended file date (filename suffix - 1 trading day)."""
+        parts = filename.split('_')
+        if len(parts) > 1:
+            date_str = parts[1].split('.')[0]
+            try:
+                f_date = datetime.strptime(date_str, "%Y%m%d").date()
+                expected = get_previous_trading_day(f_date)
+                return expected.strftime("%Y%m%d")
+            except ValueError:
+                pass
+        return None
 
-    # Determine chronological bounds by reading content of first and last file
-    first_date = get_date_from_sftp_file(sftp, target_files[0])
-    last_date = get_date_from_sftp_file(sftp, target_files[-1])
+    # Determine chronological bounds by computing expected dates of first and last file
+    first_date = extract_expected_date(target_files[0])
+    last_date = extract_expected_date(target_files[-1])
 
-    print(f"Server data (based on content) ranges from {first_date} to {last_date}")
+    print(f"Server data (expected dates based on filename suffix - 1 TRD) ranges from {first_date} to {last_date}")
 
     downloaded_paths = []
     print(f"Filtering {len(target_files)} files by timeframe...")
     for f in target_files:
-        # Instead of scanning every single file on the server (which could take a long time over SFTP for 1000+ files),
-        # we check the local cache first. If it's cached, we parse the local file date.
-        # But if it's not cached, we read the remote header.
-        local_path = os.path.join(download_dir, f)
 
-        file_date = None
-        if os.path.exists(local_path):
-            # Parse from local
-            try:
-                with open(local_path, 'r', encoding='utf-8') as local_f:
-                    head = [next(local_f) for _ in range(12)]
-                reader = csv.DictReader(head, delimiter=';')
-                dates_found = set()
-                rows = 0
-                for row in reader:
-                    if rows >= 10: break
-                    if 'tradeTime' in row and row['tradeTime']:
-                        dates_found.add(row['tradeTime'][:10].replace('-', ''))
-                    rows += 1
-                if len(dates_found) == 1:
-                    file_date = list(dates_found)[0]
-            except StopIteration:
-                pass
-
+        file_date = extract_expected_date(f)
         if not file_date:
-            file_date = get_date_from_sftp_file(sftp, f)
-
-        if not file_date:
+            print(f"Skipping {f} due to invalid filename date.")
             continue
+
+        local_path = os.path.join(download_dir, f)
 
         # Check against timeframe
         if start_date and file_date < start_date:
