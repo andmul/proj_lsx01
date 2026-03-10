@@ -15,14 +15,28 @@ def extract_names(directory):
 
     for f in files:
         try:
+            # We only need the header to check if displayName is present
             with open(f, 'r', encoding='utf-8') as file:
                 header = file.readline()
 
             if 'displayName' in header:
-                df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True)
+                # Use quote_char=None to prevent unescaped quotes from crashing the parser
+                df = pl.read_csv(
+                    f, separator=";", decimal_comma=True,
+                    ignore_errors=True, quote_char=None, truncate_ragged_lines=True
+                )
+
+                # Strip out the literal quotes that are now part of the string values
+                for col in df.columns:
+                    if df[col].dtype == pl.Utf8:
+                        df = df.with_columns(pl.col(col).str.strip_chars('"'))
+
                 if 'displayName' in df.columns and 'isin' in df.columns:
                     df = df.select(["isin", "displayName"]).drop_nulls().unique()
                     mapping_dfs.append(df)
+
+        except pl.exceptions.NoDataError:
+            pass # skip empty files silently
         except Exception as e:
             print(f"Error reading {f} for names: {e}")
 
@@ -36,7 +50,8 @@ def extract_names(directory):
 
 def get_trading_days(start_d, end_d):
     """Calculate the number of valid German trading days in the range"""
-    de_holidays = holidays.DE(years=[start_d.year, end_d.year])
+    # Create a list of all years spanning the entire range to accurately calculate internal holidays
+    de_holidays = holidays.DE(years=list(range(start_d.year, end_d.year + 1)))
     days = 0
     curr = start_d
     while curr <= end_d:
@@ -76,57 +91,99 @@ def filter_isins(df, start_date_str, end_date_str):
     final_df = final_df.drop(["trade_day", "volume"])
     return final_df
 
+import shutil
+
 def process_transactions(directory, start_date_str, end_date_str):
     files = glob.glob(os.path.join(directory, 'lsxtradesyesterday_*.csv'))
     if not files: return None
 
-    # Filter files strictly if needed, but since we already downloaded the specific ones, we can parse all in the dir
-    print(f"Loading {len(files)} files for consolidation...")
+    # We use a Map-Reduce approach to avoid Out-Of-Memory (OOM) errors.
+    # 1. Map: Convert each massive, dirty CSV into a strictly-typed, clean temporary Parquet file.
+    # This prevents storing dozens of gigabytes of raw DataFrames in RAM.
+    temp_dir = os.path.join(directory, "temp_lsx_cache")
+    os.makedirs(temp_dir, exist_ok=True)
 
-    df_list = []
+    start_d_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_d_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+
+    # Filter files based on filename prior to loading them to save disk I/O and processing time.
+    target_files = []
     for f in files:
+        filename = os.path.basename(f)
+        parts = filename.split('_')
+        if len(parts) > 1:
+            date_str = parts[1].split('.')[0]
+            try:
+                # The file represents the previous trading day, but checking the filename date
+                # against the bounds +/- 5 days is a safe loose filter before strictly filtering internally
+                file_date = datetime.strptime(date_str, "%Y%m%d").date()
+                if start_d_obj - timedelta(days=5) <= file_date <= end_d_obj + timedelta(days=5):
+                    target_files.append(f)
+            except ValueError:
+                # If we can't parse the filename, include it just in case
+                target_files.append(f)
+
+    print(f"Processing {len(target_files)} relevant files (out of {len(files)} total) into temporary cache to prevent memory exhaustion...")
+
+    for i, f in enumerate(target_files):
         try:
-            # `ignore_errors` is not fully supported in `scan_csv` when dealing with broken quotes, so
-            # we read eagerly into memory and then convert to a LazyFrame. Since we process files iteratively
-            # and append to a list of LazyFrames, `pl.concat` will stream the execution rather than holding
-            # all raw DataFrames in memory simultaneously.
-            df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True)
+            # Eagerly load the file using robust quoting constraints to bypass unescaped delimiters
+            df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True, quote_char=None, truncate_ragged_lines=True)
+
+            # Strip literal quotes out of the strings
+            for col in df.columns:
+                if df[col].dtype == pl.Utf8:
+                    df = df.with_columns(pl.col(col).str.strip_chars('"'))
+
             if 'orderId' in df.columns:
                 df = df.rename({'orderId': 'TVTIC'})
             if 'displayName' in df.columns:
                 df = df.drop('displayName')
 
-            df_list.append(df.lazy())
+            # Perform initial conversions so parquet has strict types
+            df = df.with_columns(
+                 pl.col("tradeTime")
+                 .str.replace("Z", "")
+                 .str.replace("T"," ")
+                 .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
+                .dt.replace_time_zone("UTC")
+                .dt.convert_time_zone("Europe/Berlin")
+                .alias("tradeTime"),
+
+                pl.col("publishedTime")
+                 .str.replace("Z", "")
+                 .str.replace("T"," ")
+                 .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
+                .dt.replace_time_zone("UTC")
+                .dt.convert_time_zone("Europe/Berlin")
+                .alias("publishedTime")
+            )
+
+            # Since polars might have parsed price with commas literally as string (because quote_char=None bypasses decimal_comma sometimes)
+            df = df.with_columns([
+                pl.col("price").str.replace(",", ".").cast(pl.Float64, strict=False),
+                pl.col("size").cast(pl.Int64, strict=False),
+            ])
+            df = df.drop_nulls(["price", "size", "tradeTime"])
+
+            # Run the unique constraint early per file to lower storage size
+            df = df.sort('publishedTime').unique(subset=['TVTIC'], keep='last')
+
+            out_path = os.path.join(temp_dir, f"chunk_{i}.parquet")
+            df.write_parquet(out_path)
+
+        except pl.exceptions.NoDataError:
+            pass # Skip silently
         except Exception as e:
-            print(f"Error reading {f}: {e}")
+            print(f"Error caching {f}: {e}")
 
-    # Lazily concatenate all files before executing the query
-    df = pl.concat(df_list, how="diagonal")
+    # 2. Reduce: Stream the perfectly uniform Parquet directory natively out-of-core
+    print("Executing out-of-core lazy evaluation on cached parquet files...")
 
-    df = df.with_columns(
-         pl.col("tradeTime")
-         .str.replace("Z", "")
-         .str.replace("T"," ")
-         .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
-        .dt.replace_time_zone("UTC")
-        .dt.convert_time_zone("Europe/Berlin")
-        .alias("tradeTime"),
+    # We use scan_parquet which safely streams the files natively without loading them into RAM
+    df = pl.scan_parquet(os.path.join(temp_dir, "*.parquet"))
 
-        pl.col("publishedTime")
-         .str.replace("Z", "")
-         .str.replace("T"," ")
-         .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
-        .dt.replace_time_zone("UTC")
-        .dt.convert_time_zone("Europe/Berlin")
-        .alias("publishedTime")
-    )
-
-    df = df.with_columns([
-        pl.col("price").cast(pl.Float64, strict=False),
-        pl.col("size").cast(pl.Int64, strict=False),
-    ])
-    df = df.drop_nulls(["price", "size", "tradeTime"])
-
+    # Deduplicate globally
     df = df.sort('publishedTime').unique(subset=['TVTIC'], keep='last')
 
     # Group by identical timestamp to aggregate split executions and amendments/cancellations
@@ -141,7 +198,6 @@ def process_transactions(directory, start_date_str, end_date_str):
         .alias("size")
     )
 
-    print("Executing lazy evaluation and Consolidating AMND/CANC...")
     grouped = df.group_by(["isin", "trade_sec", "price"]).agg([
         pl.col("size").sum().alias("total_size"),
         pl.col("tradeTime").first().alias("tradeTime"),
@@ -164,18 +220,16 @@ def process_transactions(directory, start_date_str, end_date_str):
     end_d = datetime.strptime(end_date_str, "%Y-%m-%d")
 
     # Convert to timezone aware datetime to filter
-    # Using localize for pytz to prevent timezone drift via historical LMT mappings
     berlin_tz = pytz.timezone("Europe/Berlin")
     start_dt = berlin_tz.localize(start_d)
 
-    # Add 1 day to end_date to include the whole day
     import datetime as dt
     end_dt = berlin_tz.localize(end_d + dt.timedelta(days=1))
 
     grouped = grouped.filter((pl.col("tradeTime") >= start_dt) & (pl.col("tradeTime") < end_dt))
 
-    # Call collect() to execute the lazy frame and materialize it into memory
-    print("Collecting final dataframe...")
+    # Collect the aggressively aggregated data into memory
+    print("Collecting and computing final dataframe...")
     try:
         collected_df = grouped.collect(engine="streaming")
     except Exception as e:
@@ -185,6 +239,10 @@ def process_transactions(directory, start_date_str, end_date_str):
     print(f"Rows strictly within {start_date_str} to {end_date_str}: {collected_df.shape[0]}")
 
     final_df = filter_isins(collected_df, start_date_str, end_date_str)
+
+    # Clean up temporary cache
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
     return final_df
 
 def main():

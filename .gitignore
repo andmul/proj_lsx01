@@ -3,3 +3,4 @@ lsxtradesyesterday_*.csv
 processed_trades.csv
 *.csv
 raw_output.parquet
+*.parquet
