@@ -9,13 +9,117 @@ import pandas as pd
 import json
 #import pyarrow
 import numpy as np
-#from ftplib import FTP
+import paramiko
+import argparse
+import stat
 
+# SFTP Configuration
+SFTP_HOST = os.environ.get("LSX_FTP_HOST", "ngcobalt350.manitu.net")
+SFTP_PORT = int(os.environ.get("LSX_FTP_PORT", 23))
+SFTP_USER = os.environ.get("LSX_FTP_USER")
+SFTP_PASS = os.environ.get("LSX_FTP_PASS")
+
+def download_files(start_date=None, end_date=None, download_dir="."):
+    """
+    Connects via SFTP, lists files matching `lsxtradesyesterday_*.csv`,
+    filters them by the provided timeframe, and downloads them.
+    Dates should be strings in format YYYYMMDD.
+    """
+    if not SFTP_USER or not SFTP_PASS:
+        print("Error: SFTP credentials not provided. Set LSX_FTP_USER and LSX_FTP_PASS environment variables.")
+        return []
+
+    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+    transport.connect(username=SFTP_USER, password=SFTP_PASS)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+
+    print("Fetching file list from server...")
+    all_files = sftp.listdir()
+    target_files = [f for f in all_files if f.startswith("lsxtradesyesterday_") and f.endswith(".csv")]
+    target_files.sort()
+
+    if not target_files:
+        print("No files found matching the pattern.")
+        sftp.close()
+        transport.close()
+        return []
+
+    import csv
+
+    import holidays
+    import datetime as dt
+
+    # Generate German holidays for calculating -1 trading day
+    # Assuming files from 2020 to 2030
+    de_holidays = holidays.DE(years=list(range(2020, 2030)))
+
+    def get_previous_trading_day(d):
+        prev_d = d - dt.timedelta(days=1)
+        while prev_d.weekday() >= 5 or prev_d in de_holidays:
+            prev_d -= dt.timedelta(days=1)
+        return prev_d
+
+    def extract_expected_date(filename):
+        """Extracts the intended file date (filename suffix - 1 trading day)."""
+        parts = filename.split('_')
+        if len(parts) > 1:
+            date_str = parts[1].split('.')[0]
+            try:
+                f_date = datetime.strptime(date_str, "%Y%m%d").date()
+                expected = get_previous_trading_day(f_date)
+                return expected.strftime("%Y%m%d")
+            except ValueError:
+                pass
+        return None
+
+    # Determine chronological bounds by computing expected dates of first and last file
+    first_date = extract_expected_date(target_files[0])
+    last_date = extract_expected_date(target_files[-1])
+
+    print(f"Server data (expected dates based on filename suffix - 1 TRD) ranges from {first_date} to {last_date}")
+
+    downloaded_paths = []
+    print(f"Filtering {len(target_files)} files by timeframe...")
+    for f in target_files:
+
+        file_date = extract_expected_date(f)
+        if not file_date:
+            print(f"Skipping {f} due to invalid filename date.")
+            continue
+
+        local_path = os.path.join(download_dir, f)
+
+        # Check against timeframe
+        if start_date and file_date < start_date:
+            continue
+        if end_date and file_date > end_date:
+            continue
+
+        downloaded_paths.append(local_path)
+        if os.path.exists(local_path):
+            print(f"File {f} ({file_date}) already exists locally, skipping download.")
+            continue
+
+        print(f"Downloading {f} ({file_date})...")
+        sftp.get(f, local_path)
+
+    sftp.close()
+    transport.close()
+    return downloaded_paths
 
 ##MAIN
 
-#Step 1: all files in last directory
-files = glob.glob(r'lsxtradesyesterday_*.csv')
+parser = argparse.ArgumentParser(description="Process LSX trade files.")
+parser.add_argument("--start", help="Start date (YYYYMMDD)", default=None)
+parser.add_argument("--end", help="End date (YYYYMMDD)", default=None)
+parser.add_argument("--skip-download", action="store_true", help="Skip SFTP download and process local files only.")
+args = parser.parse_args()
+
+# Step 1: get files
+if not args.skip_download:
+    files = download_files(args.start, args.end)
+else:
+    files = glob.glob(r'lsxtradesyesterday_*.csv')
 # Step 2: Read all CSVs into Polars DataFrames
 
 df_list = []
@@ -25,6 +129,10 @@ for f in files:
         df_list.append(pl.read_csv(f, infer_schema_length=100,separator=";",decimal_comma=True, ignore_errors=True))
     except Exception as e:
         print(f"Warning: could not read {f}: {e}")
+
+if not df_list:
+    print("No files to process. Exiting.")
+    exit(0)
 
 #delete name column from all frames
 for index,dlist in enumerate(df_list):
@@ -87,6 +195,9 @@ df = df.with_columns([
 ])
 
 # For cancellations, size is negated to subtract from the group
+# Note regarding AMND flags: As requested, AMND sizes are treated identically to
+# original trades. They simply inject the stated replacement 'size' into the timeframe aggregate
+# so that the ultimate SUM(size) reaches the mathematically desired target.
 df = df.with_columns(
     pl.when(pl.col("flags").str.contains("CANC"))
     .then(pl.col("size") * -1)
