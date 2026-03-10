@@ -183,10 +183,10 @@ def process_transactions(directory, start_date_str, end_date_str):
     # We use scan_parquet which safely streams the files natively without loading them into RAM
     df = pl.scan_parquet(os.path.join(temp_dir, "*.parquet"))
 
-    # Deduplicate globally
-    df = df.sort('publishedTime').unique(subset=['TVTIC'], keep='last')
-
     # Group by identical timestamp to aggregate split executions and amendments/cancellations
+    # NOTE: We skip global `.sort().unique()` here because we already deduplicated
+    # strictly per file during the Map phase, and doing a global out-of-core sort
+    # over 1000 files frequently triggers OS segfaults (0xC0000005) in the Polars engine.
     df = df.with_columns([
         pl.col("tradeTime").dt.truncate("1s").alias("trade_sec")
     ])
