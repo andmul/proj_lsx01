@@ -23,6 +23,7 @@ import polars as pl
 import lightgbm as lgb
 import os
 import numpy as np
+import warnings
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, precision_recall_curve
 
 def main():
@@ -92,7 +93,7 @@ def main():
     df = df.join(daily_open, on=['isin', 'trade_day'], how='left')
 
     # Calculate what the market looked like in the past 2 hours prior to each tick
-    past_features = df.rolling(index_column="tradeTime", period="2h", group_by="isin").agg([
+    past_features = df.rolling(index_column="tradeTime", period="2h", by="isin").agg([
         pl.col("price").last().alias("current_price"),
         pl.col("price").max().alias("past_2h_max_price"),
         pl.col("volume").sum().alias("past_2h_volume"),
@@ -121,7 +122,7 @@ def main():
     future_target = (
         df.select(['isin', 'tradeTime', 'price'])
         # A rolling window of 2.5h
-        .rolling(index_column="tradeTime", period="2h30m", group_by="isin")
+        .rolling(index_column="tradeTime", period="2h30m", by="isin")
         .agg([
             pl.col("price").max().alias("future_2h30m_max_price"),
             pl.col("price").last().alias("sell_price") # Price at the end of the breakout period
@@ -289,7 +290,7 @@ def main():
             executed_trades = test_df_with_signals.filter(pl.col("signal") == 1)
 
             if executed_trades.height > 0:
-                pnl = executed_trades.select((pl.col("sell_price") - pl.col("buy_price")).sum()).item()
+                pnl = executed_trades.select((((pl.col("sell_price") - pl.col("buy_price")) / pl.col("buy_price")) * 100).mean()).item()
                 # Aggregate unique trading signal dates
                 executed_dates = executed_trades.with_columns(
                     pl.col("tradeTime").dt.truncate("1d").cast(pl.Utf8).alias("trade_day_str")
@@ -309,7 +310,7 @@ def main():
                 "Model_Precision (F0.5)": f"{final_precision*100:.2f}%",
                 "Model_Recall": f"{final_recall*100:.2f}%",
                 "ROC_AUC_Score": round(auc, 4),
-                "Test_Set_PnL_Euro": round(pnl, 2),
+                "Test_Set_Avg_PnL_Percent": round(pnl, 2),
                 "Signal_Dates": signal_dates_str
             })
 
@@ -321,8 +322,8 @@ def main():
             success_count += 1
 
         except Exception as e:
-            # Suppress failing ISINs to keep console clean
-            pass
+            print(f"Model failed for ISIN {stock_isin}: {e}")
+            continue
 
     if not report_data:
         print("No ISINs successfully trained models with valid metrics.")
