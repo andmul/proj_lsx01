@@ -21,9 +21,9 @@ ARCHITECTURE NOTES FOR JULES:
 
 import polars as pl
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 import os
 import argparse
+from sklearn.metrics import roc_auc_score, precision_score, recall_score
 
 def main():
     parser = argparse.ArgumentParser(description="Train 0.5% Breakout Classifier on LSX Parquet data")
@@ -113,7 +113,9 @@ def main():
     unique_isins = final_df.select("isin").unique().to_series().to_list()
     print(f"Starting dedicated LightGBM training loop for {len(unique_isins)} models...")
 
+    report_data = []
     success_count = 0
+
     for i, stock_isin in enumerate(unique_isins):
         # Filter dataframe for just this ISIN natively in Polars
         isin_df = final_df.filter(pl.col("isin") == stock_isin)
@@ -160,15 +162,63 @@ def main():
                 num_boost_round=200,
                 callbacks=[lgb.early_stopping(stopping_rounds=10)]
             )
-            model_file = os.path.join(models_dir, f"model_{stock_isin}.txt")
-            model.save_model(model_file)
-            success_count += 1
-            if success_count % 50 == 0:
-                print(f"[{i+1}/{len(unique_isins)}] Trained and saved classifier for {stock_isin} ({isin_df.shape[0]} ticks)")
-        except Exception as e:
-            print(f"[{i+1}/{len(unique_isins)}] Error training {stock_isin}: {e}")
 
-    print(f"\nTraining pipeline complete! Successfully generated {success_count} independent ISIN models in the '{models_dir}/' directory.")
+            # Evaluate Out-Of-Sample Predictions
+            y_pred_prob = model.predict(X_test)
+            y_pred_binary = (y_pred_prob >= 0.5).astype(int)
+
+            try:
+                auc = roc_auc_score(y_test, y_pred_prob)
+                precision = precision_score(y_test, y_pred_binary, zero_division=0)
+                recall = recall_score(y_test, y_pred_binary, zero_division=0)
+            except ValueError:
+                # Triggers if the test set entirely lacks breakouts (or entirely lacks non-breakouts)
+                auc, precision, recall = 0, 0, 0
+
+            test_breakouts = int(y_test.sum())
+            breakout_freq = test_breakouts / len(y_test)
+
+            report_data.append({
+                "ISIN": stock_isin,
+                "Total_Ticks": total_rows,
+                "Test_Set_Ticks": len(y_test),
+                "Actual_Breakouts_In_Test": test_breakouts,
+                "Base_Breakout_Frequency": f"{breakout_freq*100:.2f}%",
+                "ROC_AUC_Score": round(auc, 4),
+                "Model_Precision": f"{precision*100:.2f}%",
+                "Model_Recall": f"{recall*100:.2f}%"
+            })
+
+            # Save the model only if the AUC is better than a coin flip (0.50) + slight edge (0.55)
+            # This prevents bloating the drive with 3000 models that don't work.
+            if auc >= 0.55:
+                model_file = os.path.join(models_dir, f"model_{stock_isin}.txt")
+                model.save_model(model_file)
+
+            success_count += 1
+
+        except Exception as e:
+            pass # Suppress failing ISINs to keep console clean
+
+    if not report_data:
+        print("No ISINs successfully trained models with valid metrics.")
+        return
+
+    # Create a DataFrame from the summary statistics
+    report_df = pl.DataFrame(report_data)
+    # Rank them by mathematical predictability
+    report_df = report_df.sort("ROC_AUC_Score", descending=True)
+
+    report_file = "breakout_strategy_report.csv"
+    report_df.write_csv(report_file)
+
+    print(f"\n=======================================================")
+    print(f"PIPELINE COMPLETE: Evaluated {success_count} independent ISIN models.")
+    print(f"A human-readable master report has been saved to: {report_file}")
+    print(f"Only mathematically viable models (AUC >= 0.55) were saved to '{models_dir}/'.")
+    print(f"\nTop 5 most predictable ISINs for the 0.5% breakout:")
+    print(report_df.head(5))
+    print(f"=======================================================")
 
 if __name__ == "__main__":
     main()
