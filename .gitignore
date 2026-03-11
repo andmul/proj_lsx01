@@ -5,3 +5,6 @@ processed_trades.csv
 raw_output.parquet
 *.parquet
 lsx_models/
+feature_importance.png
+breakout_classifier.txt
+lsx_breakout_models/
