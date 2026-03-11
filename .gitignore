@@ -4,3 +4,4 @@ processed_trades.csv
 *.csv
 raw_output.parquet
 *.parquet
+lsx_models/
