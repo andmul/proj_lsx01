@@ -5,6 +5,22 @@ import os
 from datetime import datetime, date, timedelta
 import holidays
 import argparse
+import time
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+def log_mem(stage=""):
+    """Helper to print current memory usage"""
+    if HAS_PSUTIL:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {stage} | Memory: {mem_mb:.2f} MB")
+    else:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {stage}")
 
 def extract_names(directory):
     files = glob.glob(os.path.join(directory, 'lsxtradesyesterday_*.csv'))
@@ -85,7 +101,6 @@ def filter_isins(df, start_date_str, end_date_str):
     print(f"ISINs must have at least {required_active_days} active days.")
 
     valid_isins = isin_active_counts.filter(pl.col("active_days_count") >= required_active_days)
-    print(f"Found {valid_isins.shape[0]} valid ISINs.")
 
     final_df = df.join(valid_isins.select("isin"), on="isin", how="inner")
     final_df = final_df.drop(["trade_day", "volume"])
@@ -123,9 +138,12 @@ def process_transactions(directory, start_date_str, end_date_str):
                 # If we can't parse the filename, include it just in case
                 target_files.append(f)
 
-    print(f"Processing {len(target_files)} relevant files (out of {len(files)} total) into temporary cache to prevent memory exhaustion...")
+    log_mem(f"Starting map phase: Processing {len(target_files)} relevant files (out of {len(files)} total) into temporary cache...")
 
     for i, f in enumerate(target_files):
+        if i > 0 and i % 50 == 0:
+            log_mem(f"  ...processed {i}/{len(target_files)} files")
+
         try:
             # Eagerly load the file using robust quoting constraints to bypass unescaped delimiters
             df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True, quote_char=None, truncate_ragged_lines=True)
@@ -177,8 +195,10 @@ def process_transactions(directory, start_date_str, end_date_str):
         except Exception as e:
             print(f"Error caching {f}: {e}")
 
+    log_mem("Finished map phase.")
+
     # 2. Reduce: Stream the perfectly uniform Parquet directory natively out-of-core
-    print("Executing out-of-core lazy evaluation on cached parquet files...")
+    log_mem("Starting reduce phase: executing out-of-core lazy evaluation on cached parquet files...")
 
     # We use scan_parquet which safely streams the files natively without loading them into RAM
     df = pl.scan_parquet(os.path.join(temp_dir, "*.parquet"))
@@ -215,11 +235,10 @@ def process_transactions(directory, start_date_str, end_date_str):
     grouped = grouped.rename({"total_size": "size"})
     grouped = grouped.drop(["trade_sec"])
 
-    # Apply ISIN filter within the timeframe
+    # Apply time boundary filter
     start_d = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_d = datetime.strptime(end_date_str, "%Y-%m-%d")
 
-    # Convert to timezone aware datetime to filter
     berlin_tz = pytz.timezone("Europe/Berlin")
     start_dt = berlin_tz.localize(start_d)
 
@@ -228,22 +247,38 @@ def process_transactions(directory, start_date_str, end_date_str):
 
     grouped = grouped.filter((pl.col("tradeTime") >= start_dt) & (pl.col("tradeTime") < end_dt))
 
-    # Collect the aggressively aggregated data into memory
-    print("Collecting and computing final dataframe...")
+    # In extremely large environments, `.collect()` can still cause OS-level kills when doing complex
+    # join aggregations. We'll sink the highly compressed intermediate grouped dataset to disk first
+    # to free memory, then filter the ISINs and sink to the master file.
+
+    intermediate_file = os.path.join(temp_dir, "intermediate_grouped.parquet")
+    log_mem("Sinking intermediate reduced dataframe to disk... (This may take a while)")
     try:
-        collected_df = grouped.collect(engine="streaming")
+        grouped.sink_parquet(intermediate_file)
+        log_mem("Successfully wrote intermediate dataset.")
+
+        # Load the newly compressed intermediate dataset back in as a LazyFrame
+        compressed_lf = pl.scan_parquet(intermediate_file)
+
+        # Apply the final ISIN filter logic natively
+        final_lf = filter_isins(compressed_lf, start_date_str, end_date_str)
+
+        master_file = "consolidated_transactions.parquet"
+        log_mem(f"Streaming final dataset directly to {master_file}...")
+        final_lf.sink_parquet(master_file)
+
+        log_mem("Master file successfully created!")
+
     except Exception as e:
-        print(f"Streaming execution failed ({e}), falling back to standard execution...")
-        collected_df = grouped.collect()
+        print(f"\nCRITICAL ERROR during execution: {e}")
+        print("The script crashed before finishing. Chunks were left behind for debugging.")
+        raise e
+    finally:
+        # ALWAYS clean up temporary cache, even if script fails mid-way
+        log_mem("Cleaning up temporary chunk files...")
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
-    print(f"Rows strictly within {start_date_str} to {end_date_str}: {collected_df.shape[0]}")
-
-    final_df = filter_isins(collected_df, start_date_str, end_date_str)
-
-    # Clean up temporary cache
-    shutil.rmtree(temp_dir, ignore_errors=True)
-
-    return final_df
+    return True
 
 def main():
     parser = argparse.ArgumentParser()
@@ -253,20 +288,16 @@ def main():
     # use parse_known_args to prevent SystemExit in Jupyter Notebook environments
     args, unknown = parser.parse_known_args()
 
-    print(f"Checking directory: {args.dir}")
+    log_mem(f"Starting LSX processing pipeline. Checking directory: {args.dir}")
 
     # 1. Extract mapping
     extract_names(args.dir)
 
     # 2. Process data
-    df = process_transactions(args.dir, args.start, args.end)
+    success = process_transactions(args.dir, args.start, args.end)
 
-    if df is not None:
-        # 4. Save to parquet with fastparquet engine/pyarrow for timezone safety
-        out_file = "consolidated_transactions.parquet"
-        print(f"Saving final dataset ({df.shape[0]} rows) to {out_file}...")
-        df.write_parquet(out_file, use_pyarrow=True)
-        print("Done!")
+    if success:
+        log_mem("Pipeline finished successfully! Check for 'consolidated_transactions.parquet' in your directory.")
 
 if __name__ == "__main__":
     main()
