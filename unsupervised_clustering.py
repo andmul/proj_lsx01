@@ -13,38 +13,91 @@ if not os.path.exists(file_path):
 
 print("Loading and querying dataset via Polars LazyFrame...")
 
-# Load and extract necessary time features
-df = (
-    pl.scan_parquet(file_path)
-    .with_columns([
+def extract_pattern_features(df_input):
+    """
+    Extracts time-series shape and trajectory patterns across 15-minute buckets
+    for the morning trading session (07:00 to 08:44).
+    """
+    df = df_input.with_columns([
         pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
-        pl.col("tradeTime").dt.hour().alias("hour"),
-        pl.col("tradeTime").dt.minute().alias("minute"),
-        (pl.col("size") * pl.col("price")).alias("volume")
+        (((pl.col("tradeTime").dt.hour() - 7) * 60 + pl.col("tradeTime").dt.minute()) // 15).cast(pl.Int32).alias("bucket")
     ])
-)
+
+    # Filter exactly between 07:00 and 08:44 (buckets 0 to 6)
+    df = df.filter((pl.col("bucket") >= 0) & (pl.col("bucket") <= 6))
+
+    # Base aggregation per bucket
+    agg = df.group_by(["isin", "trade_day", "bucket"]).agg([
+        pl.col("price").last().alias("price"),
+        (pl.col("size") * pl.col("price")).sum().alias("volume"),
+        pl.len().alias("tick_count")
+    ])
+
+    # Iterative pivoting safely handling completely empty time buckets
+    base_frame = agg.select(["isin", "trade_day"]).unique()
+    for b in range(7):
+        b_df = agg.filter(pl.col("bucket") == b).select([
+            "isin", "trade_day",
+            pl.col("price").alias(f"price_{b}"),
+            pl.col("volume").alias(f"volume_{b}"),
+            pl.col("tick_count").alias(f"tick_count_{b}")
+        ])
+        base_frame = base_frame.join(b_df, on=["isin", "trade_day"], how="left")
+
+    pivoted = base_frame
+
+    # Forward fill prices (carry forward last known price if no trades in a 15min block)
+    for b in range(1, 7):
+        pivoted = pivoted.with_columns([
+            pl.coalesce([f"price_{b}", f"price_{b-1}"]).alias(f"price_{b}")
+        ])
+
+    # Backward fill to backstop missing early buckets
+    for b in range(5, -1, -1):
+        pivoted = pivoted.with_columns([
+            pl.coalesce([f"price_{b}", f"price_{b+1}"]).alias(f"price_{b}")
+        ])
+
+    pivoted = pivoted.fill_null(0.0)
+
+    # Filter constraints to ensure healthy denominators
+    pivoted = pivoted.filter((pl.col("price_0") > 0))
+
+    # Compute normalized pattern features:
+    # 1. Price trajectory (% returns vs 07:00 bucket)
+    returns = [((pl.col(f"price_{b}") - pl.col("price_0")) / pl.col("price_0")).alias(f"ret_{b}") for b in range(1, 7)]
+
+    # 2. Volume shape (% of total morning volume in each 15-minute chunk)
+    total_vol = pl.sum_horizontal([f"volume_{b}" for b in range(7)])
+    vol_pct = [(pl.col(f"volume_{b}") / total_vol).fill_nan(0.0).alias(f"vol_pct_{b}") for b in range(7)]
+
+    # 3. Tick shape (% of total morning ticks in each 15-minute chunk)
+    total_ticks = pl.sum_horizontal([f"tick_count_{b}" for b in range(7)])
+    tick_pct = [(pl.col(f"tick_count_{b}") / total_ticks).fill_nan(0.0).alias(f"tick_pct_{b}") for b in range(7)]
+
+    final_df = pivoted.with_columns(returns + vol_pct + tick_pct + [total_vol.alias("total_volume"), total_ticks.alias("total_ticks")])
+    return final_df
+
+# Load parquet for feature extraction
+df_base = pl.scan_parquet(file_path)
+
+# Extract identical baseline features used in predict_clusters.py
+df = df_base.with_columns([
+    pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
+    pl.col("tradeTime").dt.hour().alias("hour")
+])
 
 # ==============================================================================
 # 1. EARLY MORNING WINDOW (07:00:00 to 08:44:59)
 # ==============================================================================
-# Filter trades strictly between 7am and 8:45am
-morning_df = df.filter(
-    ((pl.col("hour") == 7) | ((pl.col("hour") == 8) & (pl.col("minute") < 45)))
-)
-
 # Aggregate early morning features per ISIN per Day
-morning_agg = (
-    morning_df
-    .sort(["isin", "tradeTime"])
-    .group_by(["isin", "trade_day"])
-    .agg([
-        pl.len().alias("tick_count"),
-        pl.col("volume").sum().alias("price_volume"),
-        pl.col("price").last().alias("price_845") # The final price hit exactly before 8:45
-    ])
-    # Filter all stocks with at least 25 trades between 7 am and 8:45 am
-    .filter(pl.col("tick_count") >= 25)
-)
+morning_agg = extract_pattern_features(df_base)
+
+# Filter all stocks with at least 25 trades between 7 am and 8:45 am
+morning_agg = morning_agg.filter(pl.col("total_ticks") >= 25)
+
+# For evaluating the target pct_change later, we need the final 08:45 price which is 'price_6' in our pattern df
+morning_agg = morning_agg.rename({"price_6": "price_845"})
 
 # ==============================================================================
 # 2. REGULAR MARKET WINDOW (09:00:00 to 17:00:00)
@@ -99,16 +152,17 @@ if total_obs == 0:
     sys.exit(1)
 
 # Prepare features for clustering
-# We cluster based on: price volume, number of transactions, and price
-features = ["price_volume", "tick_count", "price_845"]
+# We cluster based on the 20-dimensional time-series shape and trajectory patterns
+features = [f"ret_{b}" for b in range(1, 7)] + [f"vol_pct_{b}" for b in range(7)] + [f"tick_pct_{b}" for b in range(7)]
 X_raw = final_df.select(features).to_numpy()
 
-# Standardize the features so KMeans isn't heavily biased by massive volume numbers
+# Standardize the features so KMeans evaluates pattern variances equally
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X_raw)
 
 print("\n" + "="*80)
 print("UNSUPERVISED K-MEANS CLUSTERING ANALYSIS (N = 3 to 50)")
+print("Based on Morning Trajectory Patterns (15-min buckets)")
 print("="*80)
 
 # Track the absolute best cluster structure discovered during the full loop
@@ -126,7 +180,6 @@ with warnings.catch_warnings():
         cluster_labels = kmeans.fit_predict(X_scaled)
 
         # Attach cluster labels back to the dataframe
-        # Overwrite the 'cluster' column each iteration
         clustered_df = final_df.with_columns([
             pl.Series("cluster", cluster_labels)
         ])
@@ -144,19 +197,18 @@ with warnings.catch_warnings():
                 pl.col("pct_change_max").mean().alias("avg_max_pct_change"),
                 (pl.col("is_advancer").sum() / pl.len() * 100).alias("advancer_ratio_pct"),
 
-                # Let's show the cluster's average underlying profile to understand *what* it is
-                pl.col("price_volume").mean().alias("avg_volume"),
-                pl.col("tick_count").mean().alias("avg_ticks"),
-                pl.col("price_845").mean().alias("avg_price")
+                # Show the cluster's average underlying profile
+                pl.col("total_volume").mean().alias("avg_volume"),
+                pl.col("total_ticks").mean().alias("avg_ticks"),
+                pl.col("ret_6").mean().alias("avg_morning_return")
             ])
             .sort("advancer_ratio_pct", descending=True)
         )
 
         print(f"\n--- N_CLUSTERS = {n_clusters} ---")
 
-        # Identify patterns: Is there a cluster heavily skewed to advancers or decliners?
-        # A completely random market would show ~50% advancers.
-        print(f"{'Cluster':<8} | {'Total Stocks':<13} | {'Avg Max Spike %':<16} | {'Advancer Ratio %':<17} | Profile (Volume / Ticks / Price)")
+        # Identify patterns
+        print(f"{'Cluster':<8} | {'Total Stocks':<13} | {'Avg Max Spike %':<16} | {'Advancer Ratio %':<17} | Profile (Volume / Ticks / Morning Ret%)")
         print("-" * 115)
 
         for row in cluster_stats.iter_rows(named=True):
@@ -169,8 +221,8 @@ with warnings.catch_warnings():
             # Profile string
             prof_vol = f"€{row['avg_volume']/1000:.0f}k" if row['avg_volume'] > 1000 else f"€{row['avg_volume']:.0f}"
             prof_ticks = f"{row['avg_ticks']:.0f}t"
-            prof_prc = f"€{row['avg_price']:.2f}"
-            profile = f"{prof_vol} / {prof_ticks} / {prof_prc}"
+            prof_ret = f"{(row['avg_morning_return'] * 100):.2f}%"
+            profile = f"{prof_vol} / {prof_ticks} / {prof_ret}"
 
             # Highlight extreme edges
             marker = ""
