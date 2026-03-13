@@ -93,14 +93,14 @@ def main():
     X_scaled = scaler.fit_transform(X_raw)
 
     print("\n" + "="*80)
-    print("UNSUPERVISED K-MEANS CLUSTERING ANALYSIS (N = 3 to 12)")
+    print("UNSUPERVISED K-MEANS CLUSTERING ANALYSIS (N = 3 to 50)")
     print("="*80)
 
     # Suppress sklearn memory leak warnings on Windows
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
 
-        for n_clusters in range(3, 13):
+        for n_clusters in range(3, 51):
             # Fit the unsupervised model
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
             cluster_labels = kmeans.fit_predict(X_scaled)
