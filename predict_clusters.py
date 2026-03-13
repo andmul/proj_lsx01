@@ -72,46 +72,8 @@ else:
 
 print(f"\nProcessing new trades from {new_trades_file}...")
 
-# Read the raw CSV exactly as formatted
-# Since there are known quoting issues, we apply the robust parser
-df_new = pl.read_csv(
-    new_trades_file,
-    separator=";",
-    decimal_comma=True,
-    ignore_errors=True,
-    quote_char=None,
-    truncate_ragged_lines=True
-)
-
-# Clean column names (strip whitespace, quotes, and Byte Order Marks if present)
-new_columns = [c.replace("\ufeff", "").strip().strip('"').strip("'") for c in df_new.columns]
-df_new.columns = new_columns
-
-# Check if tradeTime exists; if not, print debug information and try falling back
-if "tradeTime" not in df_new.columns:
-    if len(df_new.columns) == 1 and ";" not in df_new.columns[0]:
-        print("\nNotice: Single column parsed. Attempting to fall back to comma ',' separator...")
-        df_new = pl.read_csv(
-            new_trades_file,
-            separator=",",
-            ignore_errors=True,
-            quote_char=None,
-            truncate_ragged_lines=True
-        )
-        new_columns = [c.replace("\ufeff", "").strip().strip('"').strip("'") for c in df_new.columns]
-        df_new.columns = new_columns
-
-    if "tradeTime" not in df_new.columns:
-        print(f"\nError: 'tradeTime' column not found.")
-        print(f"Parsed columns: {df_new.columns}")
-        print("Please verify the CSV uses semicolons ';' or commas ',' and has standard header names.")
-        import sys
-        sys.exit(1)
-
-# Strip literal quotes and whitespace from string columns
-for col in df_new.columns:
-    if df_new[col].dtype == pl.Utf8 or df_new[col].dtype == pl.String:
-        df_new = df_new.with_columns(pl.col(col).str.strip_chars('"').str.strip_chars("'").str.strip_chars())
+# Read the CSV as simply as possible as per user request
+df_new = pl.read_csv(new_trades_file, separator=";")
 
 # Rename orderId if present
 if 'orderId' in df_new.columns:
