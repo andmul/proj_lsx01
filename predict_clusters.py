@@ -94,7 +94,6 @@ if "tradeTime" not in df_new.columns:
         df_new = pl.read_csv(
             new_trades_file,
             separator=",",
-            decimal_comma=True,
             ignore_errors=True,
             quote_char=None,
             truncate_ragged_lines=True
