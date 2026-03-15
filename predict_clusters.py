@@ -1,88 +1,50 @@
 import polars as pl
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+try:
+    from tslearn.clustering import TimeSeriesKMeans
+    from tslearn.utils import to_time_series_dataset
+    from tslearn.preprocessing import TimeSeriesScalerMinMax
+except ImportError:
+    print("Error: The 'tslearn' library is required to perform un-aggregated tick-by-tick clustering.")
+    print("Please run: pip install tslearn")
+    import sys
+    sys.exit(1)
+
 import numpy as np
 import os
 import warnings
 
-# ==============================================================================
-# 1. TRAIN BASELINE MODEL (N=30) ON HISTORICAL DATA
-# ==============================================================================
-historical_file = "consolidated_transactions.parquet"
-print(f"Loading historical training data from {historical_file}...")
-
-if not os.path.exists(historical_file):
-    print(f"Error: {historical_file} not found. Cannot compute cluster centroids without baseline data.")
-    import sys
-    sys.exit(1)
-
-def extract_pattern_features(df_input):
+def extract_raw_tick_series(df_input):
     """
-    Extracts time-series shape and trajectory patterns across 15-minute buckets
+    Extracts the un-aggregated, raw tick-by-tick arrays of Price and Cumulative Volume
     for the morning trading session (07:00 to 08:44).
     """
     df = df_input.with_columns([
         pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
-        (((pl.col("tradeTime").dt.hour() - 7) * 60 + pl.col("tradeTime").dt.minute()) // 15).cast(pl.Int32).alias("bucket")
+        pl.col("tradeTime").dt.hour().alias("hour"),
+        pl.col("tradeTime").dt.minute().alias("minute")
     ])
 
-    # Filter exactly between 07:00 and 08:44 (buckets 0 to 6)
-    df = df.filter((pl.col("bucket") >= 0) & (pl.col("bucket") <= 6))
+    # Filter exactly between 07:00 and 08:44
+    morning_df = df.filter(
+        ((pl.col("hour") == 7) | ((pl.col("hour") == 8) & (pl.col("minute") < 45)))
+    )
 
-    # Base aggregation per bucket
-    agg = df.group_by(["isin", "trade_day", "bucket"]).agg([
-        pl.col("price").last().alias("price"),
-        (pl.col("size") * pl.col("price")).sum().alias("volume"),
-        pl.len().alias("tick_count")
-    ])
-
-    # Iterative pivoting safely handling completely empty time buckets
-    base_frame = agg.select(["isin", "trade_day"]).unique()
-    for b in range(7):
-        b_df = agg.filter(pl.col("bucket") == b).select([
-            "isin", "trade_day",
-            pl.col("price").alias(f"price_{b}"),
-            pl.col("volume").alias(f"volume_{b}"),
-            pl.col("tick_count").alias(f"tick_count_{b}")
+    # Extract the exact array of raw prices and calculate raw tick volume
+    agg = (
+        morning_df
+        .sort(["isin", "tradeTime"])
+        .group_by(["isin", "trade_day"])
+        .agg([
+            pl.len().alias("total_ticks"),
+            pl.col("price").alias("price_series"),
+            (pl.col("size") * pl.col("price")).alias("tick_volume_series")
         ])
-        base_frame = base_frame.join(b_df, on=["isin", "trade_day"], how="left")
+    )
+    return agg
 
-    pivoted = base_frame
-
-    # Forward fill prices (carry forward last known price if no trades in a 15min block)
-    for b in range(1, 7):
-        pivoted = pivoted.with_columns([
-            pl.coalesce([f"price_{b}", f"price_{b-1}"]).alias(f"price_{b}")
-        ])
-
-    # Backward fill to backstop missing early buckets
-    for b in range(5, -1, -1):
-        pivoted = pivoted.with_columns([
-            pl.coalesce([f"price_{b}", f"price_{b+1}"]).alias(f"price_{b}")
-        ])
-
-    pivoted = pivoted.fill_null(0.0)
-
-    # Filter constraints to ensure healthy denominators
-    pivoted = pivoted.filter((pl.col("price_0") > 0))
-
-    # Compute normalized pattern features:
-    # 1. Price trajectory (% returns vs 07:00 bucket)
-    returns = [((pl.col(f"price_{b}") - pl.col("price_0")) / pl.col("price_0")).alias(f"ret_{b}") for b in range(1, 7)]
-
-    # 2. Volume shape (% of total morning volume in each 15-minute chunk)
-    total_vol = pl.sum_horizontal([f"volume_{b}" for b in range(7)])
-    vol_pct = [(pl.col(f"volume_{b}") / total_vol).fill_nan(0.0).alias(f"vol_pct_{b}") for b in range(7)]
-
-    # 3. Tick shape (% of total morning ticks in each 15-minute chunk)
-    total_ticks = pl.sum_horizontal([f"tick_count_{b}" for b in range(7)])
-    tick_pct = [(pl.col(f"tick_count_{b}") / total_ticks).fill_nan(0.0).alias(f"tick_pct_{b}") for b in range(7)]
-
-    final_df = pivoted.with_columns(returns + vol_pct + tick_pct + [total_vol.alias("total_volume"), total_ticks.alias("total_ticks")])
-    return final_df
 
 # ==============================================================================
-# 1. TRAIN BASELINE MODEL (N=18) ON HISTORICAL DATA
+# 1. TRAIN BASELINE MODEL (N=5) ON HISTORICAL DATA
 # ==============================================================================
 historical_file = "consolidated_transactions.parquet"
 print(f"Loading historical training data from {historical_file}...")
@@ -94,24 +56,47 @@ if not os.path.exists(historical_file):
 
 # Extract patterns and normalize vectors
 df_hist = pl.scan_parquet(historical_file)
-features_df = extract_pattern_features(df_hist).collect()
+features_df = extract_raw_tick_series(df_hist).collect()
 
 # We only consider assets with enough morning ticks to form a coherent structural pattern
 morning_agg = features_df.filter(pl.col("total_ticks") >= 25)
 
-# 20 dimensions: 6 returns + 7 volume % + 7 tick %
-features = [f"ret_{b}" for b in range(1, 7)] + [f"vol_pct_{b}" for b in range(7)] + [f"tick_pct_{b}" for b in range(7)]
+# Build sequence dataset for historical fitting
+time_series_data = []
+for row in morning_agg.iter_rows(named=True):
+    price = np.array(row["price_series"], dtype=float)
+    tick_vol = np.array(row["tick_volume_series"], dtype=float)
+    cum_vol = np.cumsum(tick_vol)
+    ts = np.column_stack((price, cum_vol))
+    time_series_data.append(ts)
 
-X_hist_raw = morning_agg.select(features).to_numpy()
+X_raw = to_time_series_dataset(time_series_data)
 
-scaler = StandardScaler()
-X_hist_scaled = scaler.fit_transform(X_hist_raw)
+# Extract max_length to correctly pad incoming daily files downstream
+max_historical_len = X_raw.shape[1]
 
-print("Fitting KMeans (n_clusters=30)...")
+# Fit Scaler
+scaler = TimeSeriesScalerMinMax()
+X_hist_scaled = scaler.fit_transform(X_raw)
+
+# Fix zero division (flatlines) while maintaining DTW structural NaNs
+for i in range(X_hist_scaled.shape[0]):
+    for d in range(X_hist_scaled.shape[2]):
+        valid_idx = ~np.isnan(X_hist_scaled[i, :, d])
+        if np.any(valid_idx) and np.all(np.isnan(X_hist_scaled[i, valid_idx, d])):
+            X_hist_scaled[i, valid_idx, d] = 0.0
+
+print("Fitting Time-Series KMeans (n_clusters=18, metric=dtw)...")
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    # Optimal N=30 from the unsupervised_clustering.py evaluation
-    kmeans = KMeans(n_clusters=30, random_state=42, n_init='auto')
+    # Optimal N=18 as explicitly stated by the user
+    kmeans = TimeSeriesKMeans(
+        n_clusters=18,
+        metric="dtw",
+        max_iter=5,
+        random_state=42,
+        n_jobs=-1
+    )
     kmeans.fit(X_hist_scaled)
 
 # ==============================================================================
@@ -159,35 +144,64 @@ df_new = df_new.with_columns([
 # 3. GENERATE PREDICTIONS
 # ==============================================================================
 # "consider only isins with >10 ticks within the 7-8:45 time window"
-new_agg = extract_pattern_features(df_new)
+new_agg = extract_raw_tick_series(df_new)
 new_agg = new_agg.filter(pl.col("total_ticks") > 10)
 
 if new_agg.shape[0] == 0:
     print("No ISINs in the new file met the >10 ticks criteria.")
 else:
-    # Scale using the historical model's exact spatial standard deviations
-    X_new_raw = new_agg.select(features).to_numpy()
+    # Convert new raw ticks to DTW padded space
+    new_time_series = []
+    for row in new_agg.iter_rows(named=True):
+        price = np.array(row["price_series"], dtype=float)
+        tick_vol = np.array(row["tick_volume_series"], dtype=float)
+        cum_vol = np.cumsum(tick_vol)
+        ts = np.column_stack((price, cum_vol))
+        new_time_series.append(ts)
+
+    # We must construct a padded dataset, but strictly bounded to max_historical_len
+    # to fit into the exact dimensional space the DTW KMeans expects.
+    X_new_raw = to_time_series_dataset(new_time_series)
+
+    # Truncate or pad manually to match historical max_len
+    current_len = X_new_raw.shape[1]
+    if current_len > max_historical_len:
+        X_new_raw = X_new_raw[:, :max_historical_len, :]
+    elif current_len < max_historical_len:
+        pad_width = max_historical_len - current_len
+        # Pad with NaNs along the time axis to respect DTW boundaries
+        X_new_raw = np.pad(X_new_raw, ((0,0), (0, pad_width), (0,0)), mode='constant', constant_values=np.nan)
+
+    # Scale independently using the DTW MinMax scaler
     X_new_scaled = scaler.transform(X_new_raw)
+
+    # Handle perfect flatlines safely
+    for i in range(X_new_scaled.shape[0]):
+        for d in range(X_new_scaled.shape[2]):
+            valid_idx = ~np.isnan(X_new_scaled[i, :, d])
+            if np.any(valid_idx) and np.all(np.isnan(X_new_scaled[i, valid_idx, d])):
+                X_new_scaled[i, valid_idx, d] = 0.0
 
     # Predict
     predicted_clusters = kmeans.predict(X_new_scaled)
 
     # Attach and output
     predictions_df = new_agg.with_columns([
-        pl.Series("Predicted_Cluster", predicted_clusters)
+        pl.Series("Predicted_Cluster", predicted_clusters),
+        (((pl.col("price_series").list.last() - pl.col("price_series").list.first()) / pl.col("price_series").list.first()) * 100).alias("morning_return_pct")
     ])
 
     # Sort logically so the user can group their orders by cluster or tick depth
     predictions_df = predictions_df.sort(["Predicted_Cluster", "total_ticks"], descending=[False, True])
 
     print("\n" + "="*80)
-    print("NEW TRADES PREDICTION OUTPUT (N=30 - SHAPE CLUSTERING)")
+    print("NEW TRADES PREDICTION OUTPUT (N=18 - DTW TIME SERIES CLUSTERING)")
     print("="*80)
     print(f"{'ISIN':<15} | {'Total Ticks':<12} | {'Morning Return (%)':<18} | {'Assigned Cluster':<16}")
     print("-" * 75)
 
     for row in predictions_df.iter_rows(named=True):
-        ret_pct = row['ret_6'] * 100
+        ret_pct = row['morning_return_pct']
         print(f"{row['isin']:<15} | {row['total_ticks']:<12.0f} | {ret_pct:>17.2f}% | C_{row['Predicted_Cluster']:<14}")
 
     predictions_df.write_csv("trades_predicted_clusters.csv")

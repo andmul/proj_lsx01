@@ -1,6 +1,14 @@
 import polars as pl
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+try:
+    from tslearn.clustering import TimeSeriesKMeans
+    from tslearn.utils import to_time_series_dataset
+    from tslearn.preprocessing import TimeSeriesScalerMinMax
+except ImportError:
+    print("Error: The 'tslearn' library is required to perform un-aggregated tick-by-tick clustering.")
+    print("Please run: pip install tslearn")
+    import sys
+    sys.exit(1)
+
 import numpy as np
 import os
 import warnings
@@ -13,91 +21,53 @@ if not os.path.exists(file_path):
 
 print("Loading and querying dataset via Polars LazyFrame...")
 
-def extract_pattern_features(df_input):
+def extract_raw_tick_series(df_input):
     """
-    Extracts time-series shape and trajectory patterns across 15-minute buckets
+    Extracts the un-aggregated, raw tick-by-tick arrays of Price and Cumulative Volume
     for the morning trading session (07:00 to 08:44).
     """
     df = df_input.with_columns([
         pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
-        (((pl.col("tradeTime").dt.hour() - 7) * 60 + pl.col("tradeTime").dt.minute()) // 15).cast(pl.Int32).alias("bucket")
+        pl.col("tradeTime").dt.hour().alias("hour"),
+        pl.col("tradeTime").dt.minute().alias("minute")
     ])
 
-    # Filter exactly between 07:00 and 08:44 (buckets 0 to 6)
-    df = df.filter((pl.col("bucket") >= 0) & (pl.col("bucket") <= 6))
+    # Filter exactly between 07:00 and 08:44
+    morning_df = df.filter(
+        ((pl.col("hour") == 7) | ((pl.col("hour") == 8) & (pl.col("minute") < 45)))
+    )
 
-    # Base aggregation per bucket
-    agg = df.group_by(["isin", "trade_day", "bucket"]).agg([
-        pl.col("price").last().alias("price"),
-        (pl.col("size") * pl.col("price")).sum().alias("volume"),
-        pl.len().alias("tick_count")
-    ])
-
-    # Iterative pivoting safely handling completely empty time buckets
-    base_frame = agg.select(["isin", "trade_day"]).unique()
-    for b in range(7):
-        b_df = agg.filter(pl.col("bucket") == b).select([
-            "isin", "trade_day",
-            pl.col("price").alias(f"price_{b}"),
-            pl.col("volume").alias(f"volume_{b}"),
-            pl.col("tick_count").alias(f"tick_count_{b}")
+    # Extract the exact array of raw prices and calculate raw tick volume
+    agg = (
+        morning_df
+        .sort(["isin", "tradeTime"])
+        .group_by(["isin", "trade_day"])
+        .agg([
+            pl.len().alias("total_ticks"),
+            pl.col("price").last().alias("price_845"), # Save the very last price before 08:45 for target calcs
+            pl.col("price").alias("price_series"),
+            (pl.col("size") * pl.col("price")).alias("tick_volume_series"),
+            (pl.col("size") * pl.col("price")).sum().alias("total_volume")
         ])
-        base_frame = base_frame.join(b_df, on=["isin", "trade_day"], how="left")
-
-    pivoted = base_frame
-
-    # Forward fill prices (carry forward last known price if no trades in a 15min block)
-    for b in range(1, 7):
-        pivoted = pivoted.with_columns([
-            pl.coalesce([f"price_{b}", f"price_{b-1}"]).alias(f"price_{b}")
-        ])
-
-    # Backward fill to backstop missing early buckets
-    for b in range(5, -1, -1):
-        pivoted = pivoted.with_columns([
-            pl.coalesce([f"price_{b}", f"price_{b+1}"]).alias(f"price_{b}")
-        ])
-
-    pivoted = pivoted.fill_null(0.0)
-
-    # Filter constraints to ensure healthy denominators
-    pivoted = pivoted.filter((pl.col("price_0") > 0))
-
-    # Compute normalized pattern features:
-    # 1. Price trajectory (% returns vs 07:00 bucket)
-    returns = [((pl.col(f"price_{b}") - pl.col("price_0")) / pl.col("price_0")).alias(f"ret_{b}") for b in range(1, 7)]
-
-    # 2. Volume shape (% of total morning volume in each 15-minute chunk)
-    total_vol = pl.sum_horizontal([f"volume_{b}" for b in range(7)])
-    vol_pct = [(pl.col(f"volume_{b}") / total_vol).fill_nan(0.0).alias(f"vol_pct_{b}") for b in range(7)]
-
-    # 3. Tick shape (% of total morning ticks in each 15-minute chunk)
-    total_ticks = pl.sum_horizontal([f"tick_count_{b}" for b in range(7)])
-    tick_pct = [(pl.col(f"tick_count_{b}") / total_ticks).fill_nan(0.0).alias(f"tick_pct_{b}") for b in range(7)]
-
-    final_df = pivoted.with_columns(returns + vol_pct + tick_pct + [total_vol.alias("total_volume"), total_ticks.alias("total_ticks")])
-    return final_df
+    )
+    return agg
 
 # Load parquet for feature extraction
 df_base = pl.scan_parquet(file_path)
 
-# Extract identical baseline features used in predict_clusters.py
+# Setup the basic day/hour tags for the market window join later
 df = df_base.with_columns([
     pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
     pl.col("tradeTime").dt.hour().alias("hour")
 ])
 
 # ==============================================================================
-# 1. EARLY MORNING WINDOW (07:00:00 to 08:44:59)
+# 1. EARLY MORNING WINDOW (07:00:00 to 08:44:59) - RAW TICK EXTRACTION
 # ==============================================================================
-# Aggregate early morning features per ISIN per Day
-morning_agg = extract_pattern_features(df_base)
+morning_agg = extract_raw_tick_series(df_base)
 
-# Filter all stocks with at least 25 trades between 7 am and 8:45 am
+# Filter all stocks with at least 25 raw ticks
 morning_agg = morning_agg.filter(pl.col("total_ticks") >= 25)
-
-# For evaluating the target pct_change later, we need the final 08:45 price which is 'price_6' in our pattern df
-morning_agg = morning_agg.rename({"price_6": "price_845"})
 
 # ==============================================================================
 # 2. REGULAR MARKET WINDOW (09:00:00 to 17:00:00)
@@ -152,17 +122,45 @@ if total_obs == 0:
     sys.exit(1)
 
 # Prepare features for clustering
-# We cluster based on the 20-dimensional time-series shape and trajectory patterns
-features = [f"ret_{b}" for b in range(1, 7)] + [f"vol_pct_{b}" for b in range(7)] + [f"tick_pct_{b}" for b in range(7)]
-X_raw = final_df.select(features).to_numpy()
+# Unroll the extracted Polars lists into numpy arrays
+time_series_data = []
+print("Structuring variable-length raw tick trajectories...")
+for row in final_df.iter_rows(named=True):
+    # Zip the raw price series and the cumulative tick volume to represent the evolving shape
+    price = np.array(row["price_series"], dtype=float)
+    tick_vol = np.array(row["tick_volume_series"], dtype=float)
+    cum_vol = np.cumsum(tick_vol)
 
-# Standardize the features so KMeans evaluates pattern variances equally
-scaler = StandardScaler()
+    # 2D array [number_of_ticks, features=2]
+    ts = np.column_stack((price, cum_vol))
+    time_series_data.append(ts)
+
+# Pad to the maximum sequence length to create a strictly typed array for distance calcs
+X_raw = to_time_series_dataset(time_series_data)
+
+# Scale them individually per sequence! (So €5 flatlines aren't treated as distant from €100 flatlines)
+# DTW will evaluate purely on the local shape of the curve
+scaler = TimeSeriesScalerMinMax()
 X_scaled = scaler.fit_transform(X_raw)
 
+# Note: TimeSeriesScalerMinMax leaves the tslearn padding (NaNs) intact.
+# For DTW, we leave the NaNs alone! `tslearn`'s DTW natively ignores trailing NaNs in distance calculations
+# so it mathematically computes the actual variable length trajectories perfectly.
+
+# Fix the flatline scaling issue (max == min) for valid data points without touching the structural NaNs
+for i in range(X_scaled.shape[0]):
+    for d in range(X_scaled.shape[2]):
+        valid_idx = ~np.isnan(X_scaled[i, :, d])
+        if np.any(valid_idx) and np.all(np.isnan(X_scaled[i, valid_idx, d])):
+            # It was a flatline that became NaN during division.
+            # We set the valid sequence length to 0.0 (the baseline)
+            X_scaled[i, valid_idx, d] = 0.0
+
+print(f"Dataset compiled. Shape: [instances: {X_scaled.shape[0]}, max_ticks: {X_scaled.shape[1]}, dims: {X_scaled.shape[2]}]")
+
 print("\n" + "="*80)
-print("UNSUPERVISED K-MEANS CLUSTERING ANALYSIS (N = 3 to 50)")
-print("Based on Morning Trajectory Patterns (15-min buckets)")
+print("UNSUPERVISED TIME SERIES K-MEANS CLUSTERING ANALYSIS (N = 3 to 50)")
+print("Based on Un-aggregated Raw Tick-by-Tick Sequences (DTW)")
 print("="*80)
 
 # Track the absolute best cluster structure discovered during the full loop
@@ -170,13 +168,20 @@ best_global_advancer_ratio = -1
 best_global_cluster_df = None
 best_n_val = 0
 
-# Suppress sklearn memory leak warnings on Windows
+# Suppress warnings
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
 
+    # User requested 3 to 50 explicitly
     for n_clusters in range(3, 51):
-        # Fit the unsupervised model
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+        # Fit the unsupervised time-series model using DTW
+        kmeans = TimeSeriesKMeans(
+            n_clusters=n_clusters,
+            metric="dtw",
+            max_iter=5,
+            random_state=42,
+            n_jobs=-1  # Parallelize to handle the DTW scaling
+        )
         cluster_labels = kmeans.fit_predict(X_scaled)
 
         # Attach cluster labels back to the dataframe
@@ -189,7 +194,9 @@ with warnings.catch_warnings():
             clustered_df
             .with_columns([
                 # Advancer = positive change, Decliner = negative or zero
-                (pl.col("pct_change_max") > 0).cast(pl.Int32).alias("is_advancer")
+                (pl.col("pct_change_max") > 0).cast(pl.Int32).alias("is_advancer"),
+                # Reconstruct morning return from first and last price in the series array
+                (((pl.col("price_series").list.last() - pl.col("price_series").list.first()) / pl.col("price_series").list.first()) * 100).alias("morning_return_pct")
             ])
             .group_by("cluster")
             .agg([
@@ -200,7 +207,7 @@ with warnings.catch_warnings():
                 # Show the cluster's average underlying profile
                 pl.col("total_volume").mean().alias("avg_volume"),
                 pl.col("total_ticks").mean().alias("avg_ticks"),
-                pl.col("ret_6").mean().alias("avg_morning_return")
+                pl.col("morning_return_pct").mean().alias("avg_morning_return")
             ])
             .sort("advancer_ratio_pct", descending=True)
         )
@@ -221,7 +228,7 @@ with warnings.catch_warnings():
             # Profile string
             prof_vol = f"€{row['avg_volume']/1000:.0f}k" if row['avg_volume'] > 1000 else f"€{row['avg_volume']:.0f}"
             prof_ticks = f"{row['avg_ticks']:.0f}t"
-            prof_ret = f"{(row['avg_morning_return'] * 100):.2f}%"
+            prof_ret = f"{row['avg_morning_return']:.2f}%"
             profile = f"{prof_vol} / {prof_ticks} / {prof_ret}"
 
             # Highlight extreme edges
