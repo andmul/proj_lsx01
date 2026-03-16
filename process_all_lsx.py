@@ -145,57 +145,146 @@ def process_transactions(directory, start_date_str, end_date_str):
             log_mem(f"  ...processed {i}/{len(target_files)} files")
 
         try:
-            # Eagerly load the file using robust quoting constraints to bypass unescaped delimiters
-            df = pl.read_csv(f, separator=";", decimal_comma=True, ignore_errors=True, quote_char=None, truncate_ragged_lines=True)
+            # We use scan_csv to lazily read the massive file directly from disk without loading it fully into RAM.
+            # However, because of malformed quotes in the LSX feeds, we must still use robust parsing limits.
+            lf = pl.scan_csv(f, separator=";", decimal_comma=True, ignore_errors=True, quote_char=None, truncate_ragged_lines=True)
 
-            # Strip literal quotes out of the strings
-            for col in df.columns:
-                if df[col].dtype == pl.Utf8:
-                    df = df.with_columns(pl.col(col).str.strip_chars('"'))
+            # Since quote_char=None brings in quoted headers like '"tradeTime"', we must eagerly rename them
+            # if necessary, or just extract the names cleanly. Eager fetch of 1 row is essentially free.
+            header_df = pl.read_csv(f, separator=";", ignore_errors=True, quote_char=None, truncate_ragged_lines=True, n_rows=1)
+            new_columns = [c.replace("\ufeff", "").strip().strip('"').strip("'") for c in header_df.columns]
 
-            if 'orderId' in df.columns:
-                df = df.rename({'orderId': 'TVTIC'})
-            if 'displayName' in df.columns:
-                df = df.drop('displayName')
+            # Set up the lazy evaluation tree
+            lf = lf.rename(dict(zip(header_df.columns, new_columns)))
 
-            # Perform initial conversions so parquet has strict types
-            df = df.with_columns(
-                 pl.col("tradeTime")
-                 .str.replace("Z", "")
-                 .str.replace("T"," ")
-                 .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
-                .dt.replace_time_zone("UTC")
-                .dt.convert_time_zone("Europe/Berlin")
-                .alias("tradeTime"),
+            if 'orderId' in new_columns:
+                lf = lf.rename({'orderId': 'TVTIC'})
+            if 'displayName' in new_columns:
+                lf = lf.drop('displayName')
 
-                pl.col("publishedTime")
-                 .str.replace("Z", "")
-                 .str.replace("T"," ")
-                 .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
-                .dt.replace_time_zone("UTC")
-                .dt.convert_time_zone("Europe/Berlin")
-                .alias("publishedTime")
+            if 'orderId' in new_columns:
+                lf = lf.rename({'orderId': 'TVTIC'})
+            if 'displayName' in new_columns:
+                lf = lf.drop('displayName')
+
+            schema = lf.collect_schema()
+
+            # Check the schema to see if tradeTime is already parsed natively or a string
+            time_dtype = schema.get("tradeTime")
+            if time_dtype == pl.String or time_dtype == pl.Utf8:
+                # Perform string conversion
+                lf = lf.with_columns([
+                    pl.col("tradeTime")
+                     .str.strip_chars('"')
+                     .str.replace("Z", "")
+                     .str.replace("T"," ")
+                     .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
+                    .dt.replace_time_zone("UTC")
+                    .dt.convert_time_zone("Europe/Berlin")
+                ])
+            else:
+                lf = lf.with_columns(pl.col("tradeTime").dt.replace_time_zone("UTC").dt.convert_time_zone("Europe/Berlin"))
+
+            pub_dtype = schema.get("publishedTime")
+            if "publishedTime" in schema.names():
+                pub_dtype = schema.get("publishedTime")
+                if pub_dtype == pl.String or pub_dtype == pl.Utf8:
+                    lf = lf.with_columns([
+                        pl.col("publishedTime")
+                         .str.strip_chars('"')
+                         .str.replace("Z", "")
+                         .str.replace("T"," ")
+                         .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
+                        .dt.replace_time_zone("UTC")
+                        .dt.convert_time_zone("Europe/Berlin")
+                    ])
+                else:
+                    lf = lf.with_columns(pl.col("publishedTime").dt.replace_time_zone("UTC").dt.convert_time_zone("Europe/Berlin"))
+
+            # Extract hour and minute natively inside the lazy frame
+            lf = lf.with_columns([
+                pl.col("tradeTime").dt.hour().alias("hour"),
+                pl.col("tradeTime").dt.minute().alias("minute"),
+                pl.col("tradeTime").dt.truncate("1d").alias("trade_day")
+            ])
+
+            # Strip literal quotes out of strings based on schema check
+            # We must verify the column STILL exists in lf.columns before stripping
+            for col_name, dtype in schema.items():
+                if col_name not in ["tradeTime", "publishedTime", "hour", "minute"] and col_name in new_columns:
+                    if dtype == pl.String or dtype == pl.Utf8:
+                        lf = lf.with_columns(pl.col(col_name).str.strip_chars('"').alias(col_name))
+
+            # Parse numerics based on schema check
+            price_dtype = schema.get("price")
+            if price_dtype == pl.String or price_dtype == pl.Utf8:
+                lf = lf.with_columns([
+                    pl.col("price").str.replace(",", ".").cast(pl.Float64, strict=False)
+                ])
+            else:
+                lf = lf.with_columns([
+                    pl.col("price").cast(pl.Float64, strict=False)
+                ])
+
+            lf = lf.with_columns(pl.col("size").cast(pl.Int64, strict=False))
+
+            lf = lf.drop_nulls(["price", "size", "tradeTime"])
+
+            # ISIN FILTER: Only keep ISIN/day combinations with >= 20 ticks between 7:30 and 9:00
+            # We want to identify them lazily, then join against the FULL daily dataset so we don't
+            # drop the afternoon data the machine learning scripts require.
+
+            valid_isins_lf = (
+                lf.filter(
+                    ((pl.col("hour") == 7) & (pl.col("minute") >= 30)) |
+                    ((pl.col("hour") == 8)) |
+                    ((pl.col("hour") == 9) & (pl.col("minute") == 0))
+                )
+                .group_by(["isin", "trade_day"])
+                .agg(pl.len().alias("morning_ticks"))
+                .filter(pl.col("morning_ticks") >= 20)
+                .select(["isin", "trade_day"])
             )
 
-            # Since polars might have parsed price with commas literally as string (because quote_char=None bypasses decimal_comma sometimes)
-            df = df.with_columns([
-                pl.col("price").str.replace(",", ".").cast(pl.Float64, strict=False),
-                pl.col("size").cast(pl.Int64, strict=False),
-            ])
-            df = df.drop_nulls(["price", "size", "tradeTime"])
+            # Join the raw full-day stream against the valid morning ISINs
+            # This massively reduces RAM usage by dropping inactive stocks entirely,
+            # while keeping the full-day trajectory for the active ones.
+            lf = lf.join(valid_isins_lf, on=["isin", "trade_day"], how="inner")
+
+            # Execute the constrained stream
+            df = lf.collect()
+
+            if df.height == 0:
+                print(f"File {f} had no ISINs matching the morning tick criteria. Skipping caching.")
+                continue
 
             # Run the unique constraint early per file to lower storage size
-            df = df.sort('publishedTime').unique(subset=['TVTIC'], keep='last')
+            # Sometimes publishedTime doesn't parse well, so fallback to tradeTime for sorting
+            sort_col = "publishedTime" if "publishedTime" in df.columns and df["publishedTime"].null_count() == 0 else "tradeTime"
+            df = df.sort(sort_col).unique(subset=['TVTIC'], keep='last')
+
+            # Cleanup temporary columns before writing parquet
+            df = df.drop(["hour", "minute", "trade_day"])
 
             out_path = os.path.join(temp_dir, f"chunk_{i}.parquet")
             df.write_parquet(out_path)
+            log_mem(f"  -> Dumped chunk_{i}.parquet (Rows: {df.height})")
 
         except pl.exceptions.NoDataError:
             pass # Skip silently
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"Error caching {f}: {e}")
 
     log_mem("Finished map phase.")
+
+    # Check if ANY chunks were written
+    chunk_files = glob.glob(os.path.join(temp_dir, "*.parquet"))
+    if not chunk_files:
+        print("Warning: No files contained valid morning trades matching the ISIN filters.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False
 
     # 2. Reduce: Stream the perfectly uniform Parquet directory natively out-of-core
     log_mem("Starting reduce phase: executing out-of-core lazy evaluation on cached parquet files...")
