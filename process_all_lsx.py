@@ -246,13 +246,60 @@ def process_transactions(directory, start_date_str, end_date_str):
                 .select(["isin", "trade_day"])
             )
 
+            # To actually join the full-day stream against the valid morning ISINs WITHOUT losing the afternoon data,
+            # we must recreate the original lazyframe stream before we filtered it.
+            # The current `lf` object was already filtered to `07:30 to 09:00` on line 191!
+
+            # Recreate the raw stream for the final join
+            raw_lf = pl.scan_csv(f, separator=";", decimal_comma=True, ignore_errors=True, quote_char=None, truncate_ragged_lines=True)
+            raw_lf = raw_lf.rename(dict(zip(header_df.columns, new_columns)))
+
+            if 'orderId' in new_columns:
+                raw_lf = raw_lf.rename({'orderId': 'TVTIC'})
+            if 'displayName' in new_columns:
+                raw_lf = raw_lf.drop('displayName')
+
+            raw_lf = raw_lf.with_columns([
+                pl.col("tradeTime")
+                 .str.strip_chars('"')
+                 .str.replace("Z", "")
+                 .str.replace("T"," ")
+                 .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
+                .dt.replace_time_zone("UTC")
+                .dt.convert_time_zone("Europe/Berlin"),
+
+                pl.col("publishedTime")
+                 .str.strip_chars('"')
+                 .str.replace("Z", "")
+                 .str.replace("T"," ")
+                 .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S%.f", strict=False)
+                .dt.replace_time_zone("UTC")
+                .dt.convert_time_zone("Europe/Berlin")
+            ])
+
+            for col_name, dtype in schema.items():
+                if col_name not in ["tradeTime", "publishedTime", "hour", "minute"] and col_name in new_columns:
+                    if dtype == pl.String or dtype == pl.Utf8:
+                        raw_lf = raw_lf.with_columns(pl.col(col_name).str.strip_chars('"').alias(col_name))
+
+            if price_dtype == pl.String or price_dtype == pl.Utf8:
+                raw_lf = raw_lf.with_columns([pl.col("price").str.replace(",", ".").cast(pl.Float64, strict=False)])
+            else:
+                raw_lf = raw_lf.with_columns([pl.col("price").cast(pl.Float64, strict=False)])
+
+            raw_lf = raw_lf.with_columns([
+                pl.col("size").cast(pl.Int64, strict=False),
+                pl.col("tradeTime").dt.truncate("1d").alias("trade_day")
+            ])
+            raw_lf = raw_lf.drop_nulls(["price", "size", "tradeTime"])
+
             # Join the raw full-day stream against the valid morning ISINs
             # This massively reduces RAM usage by dropping inactive stocks entirely,
             # while keeping the full-day trajectory for the active ones.
-            lf = lf.join(valid_isins_lf, on=["isin", "trade_day"], how="inner")
+            lf_final = raw_lf.join(valid_isins_lf, on=["isin", "trade_day"], how="inner")
 
             # Execute the constrained stream
-            df = lf.collect()
+            df = lf_final.collect()
 
             if df.height == 0:
                 print(f"File {f} had no ISINs matching the morning tick criteria. Skipping caching.")

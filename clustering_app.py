@@ -65,34 +65,51 @@ if st.sidebar.button("Run Extraction & Clustering"):
         start_val = start_hour * 60 + start_minute
         end_val = end_hour * 60 + end_minute
 
-        morning_df = df.filter((pl.col("time_val") >= start_val) & (pl.col("time_val") < end_val))
+        # For debugging data loss in the Streamlit UI
+        with st.expander("View Data Pipeline Debugger"):
+            # 1. Total Raw Row Check
+            raw_height = df.select(pl.len()).collect().item()
+            st.write(f"1. Total Raw Rows in Database: **{raw_height}**")
 
-        # Raw sequence array aggregation
-        agg = (
-            morning_df
-            .sort(["isin", "tradeTime"])
-            .group_by(["isin", "trade_day"])
-            .agg([
-                pl.len().alias("total_ticks"),
-                pl.col("price").last().alias("price_cutoff"),
-                pl.col("price").alias("price_series"),
-                (pl.col("size") * pl.col("price")).alias("tick_volume_series")
-            ])
-            .filter(pl.col("total_ticks") >= min_ticks)
-        ).collect()
+            # 2. Extract Morning Base
+            morning_df = df.filter((pl.col("time_val") >= start_val) & (pl.col("time_val") < end_val))
+            morning_height = morning_df.select(pl.len()).collect().item()
+            st.write(f"2. Raw Morning Ticks (between {start_hour:02d}:{start_minute:02d} and {end_hour:02d}:{end_minute:02d}): **{morning_height}**")
 
-        # Market targets (e.g. 09:00 to 17:00)
-        market_df = df.filter((pl.col("hour") >= end_hour) & (pl.col("hour") < 17)).collect()
-        market_highs = market_df.group_by(["isin", "trade_day"]).agg(pl.col("price").max().alias("day_high"))
+            # 3. Raw sequence array aggregation (Filtering by tick constraint)
+            agg = (
+                morning_df
+                .sort(["isin", "tradeTime"])
+                .group_by(["isin", "trade_day"])
+                .agg([
+                    pl.len().alias("total_ticks"),
+                    pl.col("price").last().alias("price_cutoff"),
+                    pl.col("price").alias("price_series"),
+                    (pl.col("size") * pl.col("price")).alias("tick_volume_series")
+                ])
+                .filter(pl.col("total_ticks") >= min_ticks)
+            ).collect()
 
-        final_df = agg.join(market_highs, on=["isin", "trade_day"], how="inner")
+            st.write(f"3. Stocks matching '> {min_ticks} ticks' criteria in the morning: **{agg.height}** ISINs")
+
+            # 4. Market targets (Afternoon check)
+            market_df = df.filter((pl.col("hour") >= end_hour) & (pl.col("hour") < 17)).collect()
+            market_height = market_df.height
+            st.write(f"4. Raw Afternoon Ticks (between {end_hour:02d}:00 and 17:00): **{market_height}**")
+
+            market_highs = market_df.group_by(["isin", "trade_day"]).agg(pl.col("price").max().alias("day_high"))
+
+            # 5. Join
+            final_df = agg.join(market_highs, on=["isin", "trade_day"], how="inner")
+            st.write(f"5. Final Matched Instances (Stocks with valid morning *AND* valid afternoon target): **{final_df.height}**")
+
+        if final_df.height == 0:
+            st.error("No instances found matching your criteria. Check the Data Pipeline Debugger above to see where the data was filtered out (e.g. no afternoon data, or morning tick constraints too strict).")
+            st.stop()
+
         final_df = final_df.with_columns([
             (((pl.col("day_high") - pl.col("price_cutoff")) / pl.col("price_cutoff")) * 100).alias("pct_change_max")
         ])
-
-        if final_df.height == 0:
-            st.error("No instances found matching your criteria. Try widening the time window or lowering Minimum Ticks.")
-            st.stop()
 
         if final_df.height > max_samples:
             st.warning(f"Data truncated to {max_samples} instances to prevent DTW CPU starvation.")
