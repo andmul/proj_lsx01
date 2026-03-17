@@ -4,7 +4,7 @@ import numpy as np
 import warnings
 import os
 import plotly.graph_objects as go
-from tslearn.clustering import TimeSeriesKMeans
+from tslearn.clustering import TimeSeriesKMeans, KShape, KernelKMeans
 from tslearn.preprocessing import TimeSeriesScalerMinMax
 from tslearn.utils import to_time_series_dataset
 
@@ -25,10 +25,16 @@ end_hour = st.sidebar.number_input("Morning End Hour", min_value=0, max_value=23
 end_minute = st.sidebar.number_input("Morning End Minute", min_value=0, max_value=59, value=0)
 
 min_ticks = st.sidebar.slider("Minimum Ticks per Morning", min_value=10, max_value=200, value=25)
-max_samples = st.sidebar.slider("Max ISINs (Prevents DTW Freezing)", min_value=50, max_value=1000, value=200)
+max_samples = st.sidebar.slider("Max ISINs (Prevents CPU Freezing)", min_value=50, max_value=1000, value=200)
 
 st.sidebar.header("2. Algorithm Configuration")
-clustering_metric = st.sidebar.selectbox("Distance Metric", ["dtw", "softdtw", "euclidean"])
+algorithm = st.sidebar.selectbox("Clustering Algorithm", [
+    "K-Means (DTW)",
+    "K-Means (Soft-DTW)",
+    "K-Means (Euclidean)",
+    "K-Shape",
+    "Kernel K-Means (Global Alignment)"
+])
 k_start = st.sidebar.number_input("Grid Search K Min", min_value=2, max_value=20, value=3)
 k_end = st.sidebar.number_input("Grid Search K Max", min_value=3, max_value=50, value=8)
 
@@ -116,12 +122,17 @@ if st.sidebar.button("Run Extraction & Clustering"):
                 if np.any(valid_idx) and np.all(np.isnan(X_scaled[i, valid_idx, d])):
                     X_scaled[i, valid_idx, d] = 0.0
 
+        # KShape and KernelKMeans rely on cross-correlation/kernels that cannot process NaNs
+        # If the user selected them, we must zero-pad the trailing NaNs explicitly.
+        if algorithm in ["K-Shape", "Kernel K-Means (Global Alignment)"]:
+            X_scaled = np.nan_to_num(X_scaled, nan=0.0)
+
     st.write(f"Sequence Matrix Compiled: `Instances={X_scaled.shape[0]} | Max Ticks={X_scaled.shape[1]} | Dims={X_scaled.shape[2]}`")
 
     # ==========================================================================
     # GRID SEARCH CLUSTERING
     # ==========================================================================
-    st.subheader(f"Grid Search Results (Metric: {clustering_metric})")
+    st.subheader(f"Grid Search Results: {algorithm}")
 
     best_ratio = -1
     best_k = 0
@@ -137,7 +148,17 @@ if st.sidebar.button("Run Extraction & Clustering"):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for k in range(k_start, k_end + 1):
-            model = TimeSeriesKMeans(n_clusters=k, metric=clustering_metric, max_iter=5, random_state=42, n_jobs=-1)
+            if algorithm == "K-Means (DTW)":
+                model = TimeSeriesKMeans(n_clusters=k, metric="dtw", max_iter=5, random_state=42, n_jobs=-1)
+            elif algorithm == "K-Means (Soft-DTW)":
+                model = TimeSeriesKMeans(n_clusters=k, metric="softdtw", max_iter=5, random_state=42, n_jobs=-1)
+            elif algorithm == "K-Means (Euclidean)":
+                model = TimeSeriesKMeans(n_clusters=k, metric="euclidean", max_iter=5, random_state=42, n_jobs=-1)
+            elif algorithm == "K-Shape":
+                model = KShape(n_clusters=k, max_iter=5, random_state=42)
+            elif algorithm == "Kernel K-Means (Global Alignment)":
+                model = KernelKMeans(n_clusters=k, kernel="gak", max_iter=5, random_state=42, n_jobs=-1)
+
             labels = model.fit_predict(X_scaled)
 
             c_df = final_df.with_columns([
@@ -174,13 +195,16 @@ if st.sidebar.button("Run Extraction & Clustering"):
         st.subheader("Discovered Centroid Shapes (Normalized Price Trajectory)")
         fig = go.Figure()
 
-        centroids = best_model.cluster_centers_
-        # Plot price dim 0 for each cluster
-        for c_idx in range(best_k):
-            # Centroids might contain trailing NaNs due to padding averaging
-            c_shape = centroids[c_idx, :, 0]
-            valid_shape = c_shape[~np.isnan(c_shape)]
-            fig.add_trace(go.Scatter(y=valid_shape, mode='lines', name=f"Cluster {c_idx}"))
+        if algorithm == "Kernel K-Means (Global Alignment)":
+            st.info("Kernel K-Means does not compute explicit Euclidean centroids in the original space, so direct shape plotting is unavailable. It evaluates pairwise alignment distances instead.")
+        else:
+            centroids = best_model.cluster_centers_
+            # Plot price dim 0 for each cluster
+            for c_idx in range(best_k):
+                # Centroids might contain trailing NaNs due to padding averaging
+                c_shape = centroids[c_idx, :, 0]
+                valid_shape = c_shape[~np.isnan(c_shape)]
+                fig.add_trace(go.Scatter(y=valid_shape, mode='lines', name=f"Cluster {c_idx}"))
 
-        fig.update_layout(xaxis_title="Normalized Tick Timeline", yaxis_title="Normalized Price [0,1]")
-        st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(xaxis_title="Normalized Tick Timeline", yaxis_title="Normalized Price [0,1]")
+            st.plotly_chart(fig, use_container_width=True)
