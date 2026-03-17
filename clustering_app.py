@@ -42,7 +42,13 @@ if st.sidebar.button("Run Extraction & Clustering"):
         # ==========================================================================
         # EXTRACT RAW TICK ARRAYS (NO BUCKETING OR RESAMPLING)
         # ==========================================================================
-        df = pl.scan_parquet(file_path).with_columns([
+        # Fallback for older Polars versions that do not have `scan_parquet` natively
+        if hasattr(pl, "scan_parquet"):
+            df = pl.scan_parquet(file_path)
+        else:
+            df = pl.read_parquet(file_path).lazy()
+
+        df = df.with_columns([
             pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
             pl.col("tradeTime").dt.hour().alias("hour"),
             pl.col("tradeTime").dt.minute().alias("minute")
