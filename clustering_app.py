@@ -56,11 +56,12 @@ if st.sidebar.button("Run Extraction & Clustering"):
 
         df = df.with_columns([
             pl.col("tradeTime").dt.truncate("1d").alias("trade_day"),
-            pl.col("tradeTime").dt.hour().alias("hour"),
-            pl.col("tradeTime").dt.minute().alias("minute")
+            pl.col("tradeTime").dt.hour().cast(pl.Int32).alias("hour"),
+            pl.col("tradeTime").dt.minute().cast(pl.Int32).alias("minute")
         ])
 
-        # We need integer logic for minute boundaries
+        # We need integer logic for minute boundaries.
+        # Explicit casting above prevents `i8` byte wrapping (e.g. 7 * 60 = -52) in Parquet LazyFrames.
         df = df.with_columns( (pl.col("hour") * 60 + pl.col("minute")).alias("time_val") )
         start_val = start_hour * 60 + start_minute
         end_val = end_hour * 60 + end_minute
